@@ -2,6 +2,9 @@
 #include <fstream>
 #include <string>
 #include <sstream>
+#include <iterator>
+
+#include <CL/cl.h>
 
 #include "onnx.proto3.pb.h"
 
@@ -118,6 +121,19 @@ string toString(const AttributeProto& attr) {
   return ss.str();
 }
 
+class CLError {
+public:
+  cl_int code;
+  CLError(cl_int code) : code(code) {}
+};
+
+cl_int clErrorCheck(cl_int result) {
+  if (result != CL_SUCCESS) {
+    throw CLError(result);
+  }
+  return result;
+}
+
 int main(int argc, char const** argv) {
   ModelProto model;
 
@@ -170,6 +186,57 @@ int main(int argc, char const** argv) {
     }
     cout << endl;
   }
+  cout << endl;
+
+  cl_uint numPlatforms = 0;
+  cl_platform_id platformId;
+  cl_device_id deviceId;
+  cl_uint numDevices = 0;
+
+  clErrorCheck(clGetPlatformIDs(1, &platformId, &numPlatforms));
+  clErrorCheck(clGetDeviceIDs(platformId, CL_DEVICE_TYPE_DEFAULT, 1, &deviceId, &numDevices));
+
+  cl_int ret;
+  cl_context context = clCreateContext(nullptr, numDevices, &deviceId, nullptr, nullptr, &ret);
+  clErrorCheck(ret);
+
+  cl_command_queue queue = clCreateCommandQueue(context, deviceId, 0, &ret);
+  clErrorCheck(ret);
+
+  const int bufferSize = 128;
+  cl_mem buf = clCreateBuffer(context, CL_MEM_READ_WRITE, bufferSize, nullptr, &ret);
+  clErrorCheck(ret);
+
+  ifstream kernelIfs("./kernel.cl");
+  string kernelStr = string(istreambuf_iterator<char>(kernelIfs), istreambuf_iterator<char>());
+  char *strptr = const_cast<char*>(kernelStr.c_str()); // strptr must not be rewrote.
+  const size_t kernelSize = kernelStr.size();
+
+  cl_program program = clCreateProgramWithSource(context, 1, (const char**)&strptr, &kernelSize, &ret);
+  clErrorCheck(ret);
+
+  clErrorCheck(clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
+
+  cl_kernel kernel = clCreateKernel(program, "hello", &ret);
+  clErrorCheck(ret);
+
+  clErrorCheck(clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&buf));
+
+  clErrorCheck(clEnqueueTask(queue, kernel, 0, nullptr, nullptr));
+
+  char str[128] = {0};
+  clErrorCheck(clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bufferSize, str, 0, nullptr, nullptr));
+
+  cout << str << endl;
+
+  // TODO: Release there objects when ever an error is occured.
+  clErrorCheck(clFlush(queue));
+  clErrorCheck(clFinish(queue));
+  clErrorCheck(clReleaseKernel(kernel));
+  clErrorCheck(clReleaseProgram(program));
+  clErrorCheck(clReleaseMemObject(buf));
+  clErrorCheck(clReleaseCommandQueue(queue));
+  clErrorCheck(clReleaseContext(context));
 
   return 0;
 }
