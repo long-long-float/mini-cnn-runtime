@@ -3,6 +3,9 @@
 #include <string>
 #include <sstream>
 #include <iterator>
+#include <vector>
+#include <memory>
+#include <stdexcept>
 
 #include <CL/cl.h>
 
@@ -10,6 +13,76 @@
 
 using namespace std;
 using namespace onnx;
+
+struct Shape {
+  int x, y, z, w;
+};
+
+enum class ElementType {
+  Float,
+  Int64,
+  Unknown,
+};
+
+ElementType toElementType(int type) {
+  switch (type) {
+    case TensorProto::FLOAT: return ElementType::Float;
+    case TensorProto::INT64: return ElementType::Int64;
+    default: return ElementType::Unknown;
+  }
+}
+
+
+// Host-side
+class Variable {
+  public:
+    string name;
+
+    union {
+      int raw[4];
+      Shape s;
+    } shape;
+
+    ElementType elemType;
+
+    vector<TensorShapeProto::Dimension> unresolvedShape;
+
+    Variable(const string &name) : name(name) {
+      shape.s.x = shape.s.y = shape.s.z = shape.s.w = 0;
+    }
+
+    Variable(const ValueInfoProto& info) : Variable(info.name()) {
+      auto& it = info.type();
+      switch (it.value_case()) {
+        case TypeProto::kTensorType:
+          {
+            auto& tensorType = it.tensor_type();
+
+            elemType = toElementType(tensorType.elem_type());
+            auto& dim = tensorType.shape().dim();
+            unresolvedShape.assign(dim.begin(), dim.end());
+
+            break;
+          }
+        default:
+          throw runtime_error("unsupported type: " + to_string(it.value_case()));
+          break;
+      }
+    }
+};
+
+class Layer {
+  public:
+    string name;
+
+    vector<Variable> inputs;
+    vector<Variable> outputs;
+
+    shared_ptr<Layer> next;
+
+    Layer(string name, const vector<Variable> &&inputs, const vector<Variable> &&outputs) : name(name), inputs(inputs), outputs(outputs), next(nullptr) {}
+    Layer(string name, const vector<Variable> &inputs, const vector<Variable> &outputs) : name(name), inputs(inputs), outputs(outputs), next(nullptr) {}
+};
 
 string toDataTypeString(int type) {
   switch (type) {
@@ -20,8 +93,8 @@ string toDataTypeString(int type) {
 }
 
 void printValueInfo(const ValueInfoProto& info) {
-  auto& it = info.type();
   cout << info.name() << ", type = ";
+  auto& it = info.type();
   switch (it.value_case()) {
     case TypeProto::kTensorType:
       {
@@ -188,6 +261,39 @@ int main(int argc, char const** argv) {
   }
   cout << endl;
 
+  // TODO: support multiple outputs
+  shared_ptr<Layer> rootLayer = make_shared<Layer>("terminal", vector<Variable>{Variable(graph.output(0))}, vector<Variable>{});
+  while (true) {
+    auto& nodes = graph.node();
+    auto prevNode = find_if(nodes.begin(), nodes.end(), [&](auto &node) {
+        auto& outputs = node.output();
+        // TODO: care multiple outputs
+        return find_if(outputs.begin(), outputs.end(), [&](auto &out) {
+            return out == rootLayer->inputs[0].name;
+            }) != outputs.end();
+        });
+
+    if (prevNode != nodes.end()) {
+      std::vector<Variable> inputs, outputs;
+      auto &i = prevNode->input();
+      auto &o = prevNode->output();
+      std::transform(i.begin(), i.end(), std::back_inserter(inputs), [](auto &n) { return Variable(n); });
+      std::transform(o.begin(), o.end(), std::back_inserter(outputs), [](auto &n) { return Variable(n); });
+
+      auto prevLayer = make_shared<Layer>(prevNode->op_type(), inputs, outputs);
+      prevLayer->next = rootLayer;
+      rootLayer = prevLayer;
+    }
+    else {
+      break;
+    }
+  }
+
+  for (auto &cur = rootLayer; cur != nullptr; cur = cur->next) {
+    cout << cur->name << endl;
+  }
+  cout << endl;
+
   cl_uint numPlatforms = 0;
   cl_platform_id platformId;
   cl_device_id deviceId;
@@ -229,7 +335,7 @@ int main(int argc, char const** argv) {
 
   cout << str << endl;
 
-  // TODO: Release there objects when ever an error is occured.
+  // TODO: Release there objects even when an error is occured.
   clErrorCheck(clFlush(queue));
   clErrorCheck(clFinish(queue));
   clErrorCheck(clReleaseKernel(kernel));
