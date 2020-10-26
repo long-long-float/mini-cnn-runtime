@@ -1,13 +1,13 @@
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <sstream>
-#include <iterator>
-#include <vector>
-#include <memory>
-#include <stdexcept>
-
 #include <CL/cl.h>
+
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "onnx.proto3.pb.h"
 
@@ -27,68 +27,89 @@ enum class ElementType {
 };
 
 template <ElementType T>
-struct ElementType2Cpp { using t = void; };
-template <> struct ElementType2Cpp<ElementType::Float> { using t = float; };
-template <> struct ElementType2Cpp<ElementType::Int64> { using t = long long; };
+struct ElementType2Cpp {
+  using t = void;
+};
+template <>
+struct ElementType2Cpp<ElementType::Float> {
+  using t = float;
+};
+template <>
+struct ElementType2Cpp<ElementType::Int64> {
+  using t = long long;
+};
 
 size_t getSize(ElementType type) {
   switch (type) {
-    case ElementType::Float: return sizeof(ElementType2Cpp<ElementType::Float>::t);
-    case ElementType::Int64: return sizeof(ElementType2Cpp<ElementType::Int64>::t);
-    default: return 0;
+    case ElementType::Float:
+      return sizeof(ElementType2Cpp<ElementType::Float>::t);
+    case ElementType::Int64:
+      return sizeof(ElementType2Cpp<ElementType::Int64>::t);
+    default:
+      return 0;
   }
 }
 
 ElementType toElementType(int type) {
   switch (type) {
-    case TensorProto::FLOAT: return ElementType::Float;
-    case TensorProto::INT64: return ElementType::Int64;
-    default: return ElementType::Unknown;
+    case TensorProto::FLOAT:
+      return ElementType::Float;
+    case TensorProto::INT64:
+      return ElementType::Int64;
+    default:
+      return ElementType::Unknown;
   }
 }
 
 std::string toDataTypeString(int type) {
   switch (type) {
-    case TensorProto::FLOAT: return "FLOAT";
-    case TensorProto::INT64: return "INT64";
-    default: return "unknown";
+    case TensorProto::FLOAT:
+      return "FLOAT";
+    case TensorProto::INT64:
+      return "INT64";
+    default:
+      return "unknown";
   }
 }
 
-
 class Tensor {
-  public:
-    std::string name;
+ public:
+  std::string name;
 
-    ElementType elemType;
-    const std::string& raw;
+  ElementType elemType;
+  const std::string& raw;
 
-    const size_t size;
+  const size_t size;
 
-    Tensor(const std::string& name, ElementType elemType, const std::string& raw) : name(name), elemType(elemType), raw(raw), size(raw.size() / getSize(elemType)) {}
-    Tensor(const TensorProto& tensor) : Tensor(tensor.name(), toElementType(tensor.data_type()), tensor.raw_data()) {}
+  Tensor(const std::string& name, ElementType elemType, const std::string& raw)
+      : name(name),
+        elemType(elemType),
+        raw(raw),
+        size(raw.size() / getSize(elemType)) {}
+  Tensor(const TensorProto& tensor)
+      : Tensor(tensor.name(), toElementType(tensor.data_type()),
+               tensor.raw_data()) {}
 
-    template <ElementType T>
-    std::vector<typename ElementType2Cpp<T>::t> getDataAs() const {
-      using Elem = typename ElementType2Cpp<T>::t;
+  template <ElementType T>
+  std::vector<typename ElementType2Cpp<T>::t> getDataAs() const {
+    using Elem = typename ElementType2Cpp<T>::t;
 
-      assert(elemType == T);
+    assert(elemType == T);
 
-      if (elemType == T) {
-        std::vector<Elem> vec(raw.size() / sizeof(Elem));
-        for (int i = 0; i < raw.size(); i += sizeof(Elem)) {
-          Elem v = Elem();
-          for (int j = 0; j < sizeof(Elem); j++) {
-            v |= (Elem)raw[i + j] << (j * 8);
-          }
-          vec[i / sizeof(Elem)] = v;
+    if (elemType == T) {
+      std::vector<Elem> vec(raw.size() / sizeof(Elem));
+      for (int i = 0; i < raw.size(); i += sizeof(Elem)) {
+        Elem v = Elem();
+        for (int j = 0; j < sizeof(Elem); j++) {
+          v |= (Elem)raw[i + j] << (j * 8);
         }
-        return vec;
+        vec[i / sizeof(Elem)] = v;
       }
-      else {
-        return std::vector<Elem>();
-      }
+      return vec;
+    } else {
+      return std::vector<Elem>();
     }
+  }
 };
 
 // template <ElementType T>
@@ -98,167 +119,172 @@ class Tensor {
 
 // Host-side
 class Variable {
-  public:
-    string name;
+ public:
+  string name;
 
-    union {
-      int raw[4];
-      Shape s;
-    } shape;
+  union {
+    int raw[4];
+    Shape s;
+  } shape;
 
-    ElementType elemType;
+  ElementType elemType;
 
-    vector<TensorShapeProto::Dimension> unresolvedShape;
+  vector<TensorShapeProto::Dimension> unresolvedShape;
 
-    shared_ptr<Tensor> tensor;
+  shared_ptr<Tensor> tensor;
 
-    Variable(const string &name) : name(name) {
-      shape.s.x = shape.s.y = shape.s.z = shape.s.w = 0;
-    }
+  Variable(const string& name) : name(name) {
+    shape.s.x = shape.s.y = shape.s.z = shape.s.w = 0;
+  }
 
-    Variable(const ValueInfoProto& info, std::shared_ptr<Tensor> tensor) : Variable(info.name()) {
-      auto& it = info.type();
-      switch (it.value_case()) {
-        case TypeProto::kTensorType:
-          {
-            auto& tensorType = it.tensor_type();
+  Variable(const ValueInfoProto& info, std::shared_ptr<Tensor> tensor)
+      : Variable(info.name()) {
+    auto& it = info.type();
+    switch (it.value_case()) {
+      case TypeProto::kTensorType: {
+        auto& tensorType = it.tensor_type();
 
-            elemType = toElementType(tensorType.elem_type());
-            auto& dim = tensorType.shape().dim();
-            unresolvedShape.assign(dim.begin(), dim.end());
+        elemType = toElementType(tensorType.elem_type());
+        auto& dim = tensorType.shape().dim();
+        unresolvedShape.assign(dim.begin(), dim.end());
 
-            // infer shape from tensor
-            int varIndex = -1;
-            int knownSize = 1;
-            for (int i = 0; i < unresolvedShape.size(); i++) {
-              auto &s = unresolvedShape[i];
+        // infer shape from tensor
+        int varIndex = -1;
+        int knownSize = 1;
+        for (int i = 0; i < unresolvedShape.size(); i++) {
+          auto& s = unresolvedShape[i];
 
-              switch (s.value_case()) {
-                case TensorShapeProto::Dimension::kDimValue:
-                  {
-                    int v = s.dim_value();
-                    shape.raw[i] = v;
-                    knownSize *= v;
-                    break;
-                  }
-                case TensorShapeProto::Dimension::kDimParam:
-                  // s.dim_param();
-                  varIndex = i;
-                  break;
-                default:
-                  break;
-              }
-            }
-            if (varIndex >= 0) {
-              cout << name << "'s tensor->size = " << tensor->size << endl;
-              shape.raw[varIndex] = tensor->size / knownSize;
-            }
-
-            break;
-          }
-        default:
-          throw runtime_error("unsupported type: " + to_string(it.value_case()));
-          break;
-      }
-
-      this->tensor = tensor;
-    }
-
-    void assignShape(const Shape &shape) {
-      this->shape.s = shape;
-    }
-
-    size_t size() const {
-      size_t s = 1;
-      for (int i = 0; i < 4; i++) s *= shape.raw[i];
-      return s;
-    }
-
-    string toString() const {
-      stringstream ss;
-      ss << name << ": [";
-      if (shape.s.x == 0 && shape.s.y == 0 && shape.s.z == 0 && shape.s.w == 0) {
-        ss << "? ";
-        for (auto& dim : unresolvedShape) {
-          switch (dim.value_case()) {
-            case TensorShapeProto::Dimension::kDimValue:
-              ss << dim.dim_value();
+          switch (s.value_case()) {
+            case TensorShapeProto::Dimension::kDimValue: {
+              int v = s.dim_value();
+              shape.raw[i] = v;
+              knownSize *= v;
               break;
+            }
             case TensorShapeProto::Dimension::kDimParam:
-              ss << dim.dim_param();
+              // s.dim_param();
+              varIndex = i;
               break;
             default:
               break;
           }
-          ss << ",";
         }
-      }
-      else {
-        for (int i = 0; i < 4; i++) {
-          ss << shape.raw[i] << ",";
+        if (varIndex >= 0) {
+          cout << name << "'s tensor->size = " << tensor->size << endl;
+          shape.raw[varIndex] = tensor->size / knownSize;
         }
+
+        break;
       }
-      ss << "]";
-      return ss.str();
+      default:
+        throw runtime_error("unsupported type: " + to_string(it.value_case()));
+        break;
     }
+
+    this->tensor = tensor;
+  }
+
+  void assignShape(const Shape& shape) { this->shape.s = shape; }
+
+  size_t size() const {
+    size_t s = 1;
+    for (int i = 0; i < 4; i++) s *= shape.raw[i];
+    return s;
+  }
+
+  string toString() const {
+    stringstream ss;
+    ss << name << ": [";
+    if (shape.s.x == 0 && shape.s.y == 0 && shape.s.z == 0 && shape.s.w == 0) {
+      ss << "? ";
+      for (auto& dim : unresolvedShape) {
+        switch (dim.value_case()) {
+          case TensorShapeProto::Dimension::kDimValue:
+            ss << dim.dim_value();
+            break;
+          case TensorShapeProto::Dimension::kDimParam:
+            ss << dim.dim_param();
+            break;
+          default:
+            break;
+        }
+        ss << ",";
+      }
+    } else {
+      for (int i = 0; i < 4; i++) {
+        ss << shape.raw[i] << ",";
+      }
+    }
+    ss << "]";
+    return ss.str();
+  }
 };
 
 class Layer {
-  public:
-    string name;
+ public:
+  string name;
 
-    using Variables = std::vector<std::shared_ptr<Variable>>;
-    Variables inputs;
-    Variables outputs;
+  using Variables = std::vector<std::shared_ptr<Variable>>;
+  Variables inputs;
+  Variables outputs;
 
-    using Attributes = std::vector<AttributeProto>;
-    Attributes attributes;
+  using Attributes = std::vector<AttributeProto>;
+  Attributes attributes;
 
-    shared_ptr<Layer> next;
+  shared_ptr<Layer> next;
 
-    Layer(string name, const Variables &&inputs, const Variables &&outputs, const Attributes &&attributes)
-      : name(name), inputs(inputs), outputs(outputs), attributes(attributes), next(nullptr) {}
-    Layer(string name, const Variables &inputs, const Variables &outputs, const Attributes &attributes)
-      : name(name), inputs(inputs), outputs(outputs), attributes(attributes), next(nullptr) {}
+  Layer(string name, const Variables&& inputs, const Variables&& outputs,
+        const Attributes&& attributes)
+      : name(name),
+        inputs(inputs),
+        outputs(outputs),
+        attributes(attributes),
+        next(nullptr) {}
+  Layer(string name, const Variables& inputs, const Variables& outputs,
+        const Attributes& attributes)
+      : name(name),
+        inputs(inputs),
+        outputs(outputs),
+        attributes(attributes),
+        next(nullptr) {}
 
-    string toString() const {
-      stringstream ss;
-      ss << name << "\n";
-      for (auto& i : inputs) {
-        ss << "  " << i->toString() << ", ";
-      }
-      ss << " => \n";
-      for (auto& o : outputs) {
-        ss << "  " << o->toString() << ", ";
-      }
-      return ss.str();
+  string toString() const {
+    stringstream ss;
+    ss << name << "\n";
+    for (auto& i : inputs) {
+      ss << "  " << i->toString() << ", ";
     }
+    ss << " => \n";
+    for (auto& o : outputs) {
+      ss << "  " << o->toString() << ", ";
+    }
+    return ss.str();
+  }
 };
 
 void printValueInfo(const ValueInfoProto& info) {
   cout << info.name() << ", type = ";
   auto& it = info.type();
   switch (it.value_case()) {
-    case TypeProto::kTensorType:
-      {
-        auto& tensorType = it.tensor_type();
-        cout << "(" << toDataTypeString(tensorType.elem_type()) << ", [";
-        for (auto& dim : tensorType.shape().dim()) {
-          switch (dim.value_case()) {
-            case TensorShapeProto::Dimension::kDimValue:
-              cout << dim.dim_value();
-              break;
-            case TensorShapeProto::Dimension::kDimParam:
-              cout << dim.dim_param();
-              break;
-            default:
-              break;
-          }
-          cout << ",";
+    case TypeProto::kTensorType: {
+      auto& tensorType = it.tensor_type();
+      cout << "(" << toDataTypeString(tensorType.elem_type()) << ", [";
+      for (auto& dim : tensorType.shape().dim()) {
+        switch (dim.value_case()) {
+          case TensorShapeProto::Dimension::kDimValue:
+            cout << dim.dim_value();
+            break;
+          case TensorShapeProto::Dimension::kDimParam:
+            cout << dim.dim_param();
+            break;
+          default:
+            break;
         }
-        cout << "])" << endl;
-        break;
+        cout << ",";
       }
+      cout << "])" << endl;
+      break;
+    }
     default:
       cout << "unsupported type" << endl;
       break;
@@ -274,41 +300,39 @@ void printTensor(const TensorProto& tensor) {
   cout << ")";
 
   switch (tensor.data_type()) {
-    case TensorProto::INT64:
-      {
-        cout << "[";
-        auto raw = tensor.raw_data();
-        for (int i = 0; i < raw.size(); i += 8) {
-          long int v = 0;
-          for (int j = 0; j < 8; j++) {
-            v |= (unsigned char)raw[i + j] << (j * 8);
-          }
-          cout << v << " ";
+    case TensorProto::INT64: {
+      cout << "[";
+      auto raw = tensor.raw_data();
+      for (int i = 0; i < raw.size(); i += 8) {
+        long int v = 0;
+        for (int j = 0; j < 8; j++) {
+          v |= (unsigned char)raw[i + j] << (j * 8);
         }
-        cout << "]";
-
-        break;
+        cout << v << " ";
       }
-    case TensorProto::FLOAT:
-      {
-        cout << "[";
-        auto raw = tensor.raw_data();
-        for (int i = 0; i < raw.size(); i += 4) {
-          int v = 0;
-          for (int j = 0; j < 4; j++) {
-            v |= (unsigned char)raw[i + j] << (j * 4);
-          }
-          cout << *reinterpret_cast<float*>(&v) << " ";
+      cout << "]";
 
-          if (i > 40) {
-            cout << "...";
-            break;
-          }
+      break;
+    }
+    case TensorProto::FLOAT: {
+      cout << "[";
+      auto raw = tensor.raw_data();
+      for (int i = 0; i < raw.size(); i += 4) {
+        int v = 0;
+        for (int j = 0; j < 4; j++) {
+          v |= (unsigned char)raw[i + j] << (j * 4);
         }
-        cout << "]";
+        cout << *reinterpret_cast<float*>(&v) << " ";
 
-        break;
+        if (i > 40) {
+          cout << "...";
+          break;
+        }
       }
+      cout << "]";
+
+      break;
+    }
 
     default:
       cout << "(" << tensor.data_type() << ")";
@@ -338,7 +362,7 @@ string toString(const AttributeProto& attr) {
 }
 
 class CLError {
-public:
+ public:
   cl_int code;
   CLError(cl_int code) : code(code) {}
 };
@@ -397,13 +421,13 @@ int main(int argc, char const** argv) {
     cout << endl;
 
     cout << "  ";
-    for (auto &input : node.input()) {
+    for (auto& input : node.input()) {
       cout << input << ", ";
     }
     cout << " --> " << endl;
 
     cout << "  ";
-    for (auto &output : node.output()) {
+    for (auto& output : node.output()) {
       cout << output << ", ";
     }
     cout << endl;
@@ -416,7 +440,7 @@ int main(int argc, char const** argv) {
     inputData.push_back(i);
   }
   std::string inputRaw;
-  for (auto &v : inputData) {
+  for (auto& v : inputData) {
     size_t elemSize = sizeof(decltype(inputData)::value_type);
     int iv = 0;
     std::memcpy(&iv, &v, elemSize);
@@ -425,62 +449,72 @@ int main(int argc, char const** argv) {
     }
   }
 
+  // std::shared_ptr<Layer> rootLayer = std::make_shared<Layer>(
+  //     "terminal",
+  //     Layer::Variables{std::make_shared<Variable>(graph.output(0), nullptr)},
+  //     Layer::Variables{}, Layer::Attributes{});
   // TODO: support multiple outputs
-  // std::shared_ptr<Layer> rootLayer = std::make_shared<Layer>("terminal", Layer::Variables{std::make_shared<Variable>(graph.output(0), nullptr)}, Layer::Variables{}, Layer::Attributes{});
-  std::shared_ptr<Layer> rootLayer = std::make_shared<Layer>("terminal", Layer::Variables{std::make_shared<Variable>(graph.output(0).name())}, Layer::Variables{}, Layer::Attributes{});
+  std::shared_ptr<Layer> rootLayer = std::make_shared<Layer>(
+      "terminal",
+      Layer::Variables{std::make_shared<Variable>(graph.output(0).name())},
+      Layer::Variables{}, Layer::Attributes{});
   std::map<std::string, std::shared_ptr<Variable>> variableMap;
 
   while (true) {
     auto& nodes = graph.node();
-    auto prevNode = find_if(nodes.begin(), nodes.end(), [&](auto &node) {
-        auto& outputs = node.output();
-        // TODO: care multiple outputs
-        return find_if(outputs.begin(), outputs.end(), [&](auto &out) {
-            return out == rootLayer->inputs[0]->name;
-            }) != outputs.end();
-        });
+    auto prevNode = find_if(nodes.begin(), nodes.end(), [&](auto& node) {
+      auto& outputs = node.output();
+      // TODO: care multiple outputs
+      return find_if(outputs.begin(), outputs.end(), [&](auto& out) {
+               return out == rootLayer->inputs[0]->name;
+             }) != outputs.end();
+    });
 
     if (prevNode != nodes.end()) {
       Layer::Variables inputs, outputs;
-      auto &i = prevNode->input();
-      auto &o = prevNode->output();
+      auto& i = prevNode->input();
+      auto& o = prevNode->output();
 
       auto registerVariable = [&](const std::shared_ptr<Variable> v) {
         auto it = variableMap.find(v->name);
         if (it == variableMap.end()) {
           variableMap.emplace(v->name, v);
           return v;
-        }
-        else {
+        } else {
           return it->second;
         }
       };
 
-      std::transform(i.begin(), i.end(), std::back_inserter(inputs), [&](auto &n) {
-          auto it = inputMap.find(n);
-          if (it != inputMap.end()) {
-            auto itt = initMap.find(n);
-            auto tensor = (itt != initMap.end()) ?
-              itt->second :
-              // this tensor is the input of the graph
-              std::make_shared<Tensor>(n, ElementType::Float, inputRaw);
-            return registerVariable(std::make_shared<Variable>(it->second, tensor));
-          }
-          else {
-            return registerVariable(std::make_shared<Variable>(n));
-          }
+      std::transform(
+          i.begin(), i.end(), std::back_inserter(inputs), [&](auto& n) {
+            auto it = inputMap.find(n);
+            if (it != inputMap.end()) {
+              auto itt = initMap.find(n);
+              auto tensor =
+                  (itt != initMap.end())
+                      ? itt->second
+                      :
+                      // this tensor is the input of the graph
+                      std::make_shared<Tensor>(n, ElementType::Float, inputRaw);
+              return registerVariable(
+                  std::make_shared<Variable>(it->second, tensor));
+            } else {
+              return registerVariable(std::make_shared<Variable>(n));
+            }
           });
-      std::transform(o.begin(), o.end(), std::back_inserter(outputs), [&](auto &n) {
-          return registerVariable(std::make_shared<Variable>(n)); });
+      std::transform(o.begin(), o.end(), std::back_inserter(outputs),
+                     [&](auto& n) {
+                       return registerVariable(std::make_shared<Variable>(n));
+                     });
 
-      auto &a = prevNode->attribute();
+      auto& a = prevNode->attribute();
       Layer::Attributes attributes(a.begin(), a.end());
 
-      auto prevLayer = make_shared<Layer>(prevNode->op_type(), inputs, outputs, attributes);
+      auto prevLayer =
+          make_shared<Layer>(prevNode->op_type(), inputs, outputs, attributes);
       prevLayer->next = rootLayer;
       rootLayer = prevLayer;
-    }
-    else {
+    } else {
       break;
     }
   }
@@ -493,9 +527,9 @@ int main(int argc, char const** argv) {
   // resolve shapes of variables
   for (auto cur = rootLayer; cur != nullptr; cur = cur->next) {
     if (cur->name == "Reshape") {
-      auto &data = cur->inputs[0];
-      auto &shape = cur->inputs[1];
-      auto &reshaped = cur->outputs[0];
+      auto& data = cur->inputs[0];
+      auto& shape = cur->inputs[1];
+      auto& reshaped = cur->outputs[0];
 
       auto shapeValue = shape->tensor->getDataAs<ElementType::Int64>();
       shapeValue.resize(4, 0);
@@ -509,8 +543,7 @@ int main(int argc, char const** argv) {
 
         if (shapeValue[i] == -1) {
           varIndex = i;
-        }
-        else {
+        } else {
           knownSize *= shapeValue[i];
         }
       }
@@ -524,9 +557,8 @@ int main(int argc, char const** argv) {
       newShape.z = shapeValue[2];
       newShape.w = shapeValue[3];
       reshaped->assignShape(newShape);
-    }
-    else if (cur->name == "terminal") {}
-    else {
+    } else if (cur->name == "terminal") {
+    } else {
       cur->outputs[0]->assignShape(cur->inputs[0]->shape.s);
     }
   }
@@ -542,28 +574,36 @@ int main(int argc, char const** argv) {
   cl_uint numDevices = 0;
 
   clErrorCheck(clGetPlatformIDs(1, &platformId, &numPlatforms));
-  clErrorCheck(clGetDeviceIDs(platformId, CL_DEVICE_TYPE_DEFAULT, 1, &deviceId, &numDevices));
+  clErrorCheck(clGetDeviceIDs(platformId, CL_DEVICE_TYPE_DEFAULT, 1, &deviceId,
+                              &numDevices));
 
   cl_int ret;
-  cl_context context = clCreateContext(nullptr, numDevices, &deviceId, nullptr, nullptr, &ret);
+  cl_context context =
+      clCreateContext(nullptr, numDevices, &deviceId, nullptr, nullptr, &ret);
   clErrorCheck(ret);
 
-  cl_command_queue queue = clCreateCommandQueueWithProperties(context, deviceId, 0, &ret);
+  cl_command_queue queue =
+      clCreateCommandQueueWithProperties(context, deviceId, 0, &ret);
   clErrorCheck(ret);
 
   const int bufferSize = 128;
-  cl_mem buf = clCreateBuffer(context, CL_MEM_READ_WRITE, bufferSize, nullptr, &ret);
+  cl_mem buf =
+      clCreateBuffer(context, CL_MEM_READ_WRITE, bufferSize, nullptr, &ret);
   clErrorCheck(ret);
 
   ifstream kernelIfs("./kernel.cl");
-  string kernelStr = string(istreambuf_iterator<char>(kernelIfs), istreambuf_iterator<char>());
-  char *strptr = const_cast<char*>(kernelStr.c_str()); // strptr must not be rewrote.
+  string kernelStr =
+      string(istreambuf_iterator<char>(kernelIfs), istreambuf_iterator<char>());
+  char* strptr =
+      const_cast<char*>(kernelStr.c_str());  // strptr must not be rewrote.
   const size_t kernelSize = kernelStr.size();
 
-  cl_program program = clCreateProgramWithSource(context, 1, (const char**)&strptr, &kernelSize, &ret);
+  cl_program program = clCreateProgramWithSource(
+      context, 1, (const char**)&strptr, &kernelSize, &ret);
   clErrorCheck(ret);
 
-  clErrorCheck(clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
+  clErrorCheck(
+      clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
 
   cl_kernel kernel = clCreateKernel(program, "hello", &ret);
   clErrorCheck(ret);
@@ -572,10 +612,12 @@ int main(int argc, char const** argv) {
 
   const size_t globalSize[] = {1};
   const size_t localSize[] = {1};
-  clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize, localSize, 0, nullptr, nullptr));
+  clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize,
+                                      localSize, 0, nullptr, nullptr));
 
   char str[128] = {0};
-  clErrorCheck(clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bufferSize, str, 0, nullptr, nullptr));
+  clErrorCheck(clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bufferSize, str, 0,
+                                   nullptr, nullptr));
 
   cout << str << endl;
 
