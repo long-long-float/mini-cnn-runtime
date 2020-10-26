@@ -32,6 +32,29 @@ ElementType toElementType(int type) {
   }
 }
 
+std::string toDataTypeString(int type) {
+  switch (type) {
+    case TensorProto::FLOAT: return "FLOAT";
+    case TensorProto::INT64: return "INT64";
+    default: return "unknown";
+  }
+}
+
+class Tensor {
+  public:
+    std::string name;
+
+    ElementType elemType;
+    const std::string& raw;
+
+    Tensor(const std::string& name, ElementType elemType, const std::string& raw) : name(name), elemType(elemType), raw(raw) {}
+    Tensor(const TensorProto& tensor) : Tensor(tensor.name(), toElementType(tensor.data_type()), tensor.raw_data()) {}
+};
+
+// template <ElementType T>
+// class TensorImpl : private Tensor {
+//
+// };
 
 // Host-side
 class Variable {
@@ -47,11 +70,13 @@ class Variable {
 
     vector<TensorShapeProto::Dimension> unresolvedShape;
 
+    shared_ptr<Tensor> tensor;
+
     Variable(const string &name) : name(name) {
       shape.s.x = shape.s.y = shape.s.z = shape.s.w = 0;
     }
 
-    Variable(const ValueInfoProto& info) : Variable(info.name()) {
+    Variable(const ValueInfoProto& info, std::shared_ptr<Tensor> tensor) : Variable(info.name()) {
       auto& it = info.type();
       switch (it.value_case()) {
         case TypeProto::kTensorType:
@@ -68,6 +93,35 @@ class Variable {
           throw runtime_error("unsupported type: " + to_string(it.value_case()));
           break;
       }
+
+      this->tensor = tensor;
+    }
+
+    string toString() const {
+      stringstream ss;
+      ss << name << ": [";
+      if (shape.s.x == 0 && shape.s.y == 0 && shape.s.z == 0 && shape.s.w == 0) {
+        for (auto& dim : unresolvedShape) {
+          switch (dim.value_case()) {
+            case TensorShapeProto::Dimension::kDimValue:
+              ss << dim.dim_value();
+              break;
+            case TensorShapeProto::Dimension::kDimParam:
+              ss << dim.dim_param();
+              break;
+            default:
+              break;
+          }
+          ss << ",";
+        }
+      }
+      else {
+        for (int i = 0; i < 4; i++) {
+          ss << shape.raw[i] << ",";
+        }
+      }
+      ss << "]";
+      return ss.str();
     }
 };
 
@@ -75,22 +129,33 @@ class Layer {
   public:
     string name;
 
-    vector<Variable> inputs;
-    vector<Variable> outputs;
+    using Variables = std::vector<std::shared_ptr<Variable>>;
+    Variables inputs;
+    Variables outputs;
+
+    using Attributes = std::vector<AttributeProto>;
+    Attributes attributes;
 
     shared_ptr<Layer> next;
 
-    Layer(string name, const vector<Variable> &&inputs, const vector<Variable> &&outputs) : name(name), inputs(inputs), outputs(outputs), next(nullptr) {}
-    Layer(string name, const vector<Variable> &inputs, const vector<Variable> &outputs) : name(name), inputs(inputs), outputs(outputs), next(nullptr) {}
-};
+    Layer(string name, const Variables &&inputs, const Variables &&outputs, const Attributes &&attributes)
+      : name(name), inputs(inputs), outputs(outputs), attributes(attributes), next(nullptr) {}
+    Layer(string name, const Variables &inputs, const Variables &outputs, const Attributes &attributes)
+      : name(name), inputs(inputs), outputs(outputs), attributes(attributes), next(nullptr) {}
 
-string toDataTypeString(int type) {
-  switch (type) {
-    case TensorProto::FLOAT: return "FLOAT";
-    case TensorProto::INT64: return "INT64";
-    default: return "unknown";
-  }
-}
+    string toString() const {
+      stringstream ss;
+      ss << name << " ";
+      for (auto& i : inputs) {
+        ss << i->toString() << ", ";
+      }
+      ss << " => ";
+      for (auto& o : outputs) {
+        ss << o->toString() << ", ";
+      }
+      return ss.str();
+    }
+};
 
 void printValueInfo(const ValueInfoProto& info) {
   cout << info.name() << ", type = ";
@@ -215,14 +280,20 @@ int main(int argc, char const** argv) {
 
   auto& graph = model.graph();
 
+  std::map<std::string, std::shared_ptr<Tensor>> initMap;
   cout << "Initializer: " << endl;
   for (auto& init : graph.initializer()) {
+    initMap.emplace(init.name(), std::make_shared<Tensor>(init));
     printTensor(init);
   }
   cout << endl;
 
+  std::map<std::string, const ValueInfoProto&> inputMap;
   cout << "Inputs: " << endl;
   for (auto& input : graph.input()) {
+    // This makes invalid entries that second values are broken.
+    // inputMap.insert(std::make_pair(input.name(), input));
+    inputMap.emplace(input.name(), input);
     printValueInfo(input);
   }
   cout << endl;
@@ -261,26 +332,59 @@ int main(int argc, char const** argv) {
   }
   cout << endl;
 
+  // test input
+  std::vector<float> inputData;
+  for (int i = 0; i < 28 * 28; i++) {
+    inputData.push_back(i);
+  }
+  std::string inputRaw;
+  for (auto &v : inputData) {
+    size_t elemSize = sizeof(decltype(inputData)::value_type);
+    int iv = 0;
+    std::memcpy(&iv, &v, elemSize);
+    for (int i = 0; i < elemSize; i++) {
+      inputRaw.push_back(iv & (0xffu << (i * 8)));
+    }
+  }
+
   // TODO: support multiple outputs
-  shared_ptr<Layer> rootLayer = make_shared<Layer>("terminal", vector<Variable>{Variable(graph.output(0))}, vector<Variable>{});
+  shared_ptr<Layer> rootLayer = make_shared<Layer>("terminal", Layer::Variables{std::make_shared<Variable>(graph.output(0), nullptr)}, Layer::Variables{}, Layer::Attributes{});
   while (true) {
     auto& nodes = graph.node();
     auto prevNode = find_if(nodes.begin(), nodes.end(), [&](auto &node) {
         auto& outputs = node.output();
         // TODO: care multiple outputs
         return find_if(outputs.begin(), outputs.end(), [&](auto &out) {
-            return out == rootLayer->inputs[0].name;
+            return out == rootLayer->inputs[0]->name;
             }) != outputs.end();
         });
 
     if (prevNode != nodes.end()) {
-      std::vector<Variable> inputs, outputs;
+      Layer::Variables inputs, outputs;
       auto &i = prevNode->input();
       auto &o = prevNode->output();
-      std::transform(i.begin(), i.end(), std::back_inserter(inputs), [](auto &n) { return Variable(n); });
-      std::transform(o.begin(), o.end(), std::back_inserter(outputs), [](auto &n) { return Variable(n); });
+      std::transform(i.begin(), i.end(), std::back_inserter(inputs), [&](auto &n) {
+          auto it = inputMap.find(n);
+          if (it != inputMap.end()) {
+            auto itt = initMap.find(n);
+            if (itt != initMap.end()) {
+              return std::make_shared<Variable>(it->second, itt->second);
+            }
+            else {
+              // tensor is the input of the graph
+              return std::make_shared<Variable>(it->second, std::make_shared<Tensor>(n, ElementType::Float, inputRaw));
+            }
+          }
+          else {
+            return std::make_shared<Variable>(n);
+          }
+          });
+      std::transform(o.begin(), o.end(), std::back_inserter(outputs), [](auto &n) { return std::make_shared<Variable>(n); });
 
-      auto prevLayer = make_shared<Layer>(prevNode->op_type(), inputs, outputs);
+      auto &a = prevNode->attribute();
+      Layer::Attributes attributes(a.begin(), a.end());
+
+      auto prevLayer = make_shared<Layer>(prevNode->op_type(), inputs, outputs, attributes);
       prevLayer->next = rootLayer;
       rootLayer = prevLayer;
     }
@@ -290,9 +394,14 @@ int main(int argc, char const** argv) {
   }
 
   for (auto &cur = rootLayer; cur != nullptr; cur = cur->next) {
-    cout << cur->name << endl;
+    cout << cur->toString() << endl;
   }
   cout << endl;
+
+  // resolve shapes of variables
+  for (auto &cur = rootLayer; cur != nullptr; cur = cur->next) {
+
+  }
 
   cl_uint numPlatforms = 0;
   cl_platform_id platformId;
@@ -306,7 +415,7 @@ int main(int argc, char const** argv) {
   cl_context context = clCreateContext(nullptr, numDevices, &deviceId, nullptr, nullptr, &ret);
   clErrorCheck(ret);
 
-  cl_command_queue queue = clCreateCommandQueue(context, deviceId, 0, &ret);
+  cl_command_queue queue = clCreateCommandQueueWithProperties(context, deviceId, 0, &ret);
   clErrorCheck(ret);
 
   const int bufferSize = 128;
@@ -328,7 +437,9 @@ int main(int argc, char const** argv) {
 
   clErrorCheck(clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&buf));
 
-  clErrorCheck(clEnqueueTask(queue, kernel, 0, nullptr, nullptr));
+  const size_t globalSize[] = {1};
+  const size_t localSize[] = {1};
+  clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize, localSize, 0, nullptr, nullptr));
 
   char str[128] = {0};
   clErrorCheck(clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bufferSize, str, 0, nullptr, nullptr));
