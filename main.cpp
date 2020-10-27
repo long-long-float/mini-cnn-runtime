@@ -4,6 +4,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -13,6 +14,9 @@
 
 using namespace std;
 using namespace onnx;
+
+template <typename... T>
+struct TypeDisplayer;
 
 struct Shape {
   int x, y, z, w;
@@ -170,7 +174,6 @@ class Variable {
           }
         }
         if (varIndex >= 0) {
-          cout << name << "'s tensor->size = " << tensor->size << endl;
           shape.raw[varIndex] = tensor->size / knownSize;
         }
 
@@ -231,7 +234,8 @@ class Layer {
   using Attributes = std::vector<AttributeProto>;
   Attributes attributes;
 
-  shared_ptr<Layer> next;
+  std::shared_ptr<Layer> child;
+  std::vector<std::shared_ptr<Layer>> parents;
 
   Layer(string name, const Variables&& inputs, const Variables&& outputs,
         const Attributes&& attributes)
@@ -239,14 +243,14 @@ class Layer {
         inputs(inputs),
         outputs(outputs),
         attributes(attributes),
-        next(nullptr) {}
+        child(nullptr) {}
   Layer(string name, const Variables& inputs, const Variables& outputs,
         const Attributes& attributes)
       : name(name),
         inputs(inputs),
         outputs(outputs),
         attributes(attributes),
-        next(nullptr) {}
+        child(nullptr) {}
 
   string toString() const {
     stringstream ss;
@@ -375,9 +379,20 @@ cl_int clErrorCheck(cl_int result) {
 }
 
 int main(int argc, char const** argv) {
+  if (argc != 2) {
+    cerr << argv[0] << " [onnx file]" << endl;
+    return 1;
+  }
+
+  std::string onnxFileName(argv[1]);
+
   ModelProto model;
 
-  fstream input("./mnist.onnx", ios::in | ios::binary);
+  fstream input(onnxFileName, ios::in | ios::binary);
+  if (!input.is_open()) {
+    cerr << "onnx file cannot be opened: " << onnxFileName << endl;
+    return 1;
+  }
   model.ParseFromIstream(&input);
 
   auto& graph = model.graph();
@@ -449,83 +464,138 @@ int main(int argc, char const** argv) {
     }
   }
 
-  // std::shared_ptr<Layer> rootLayer = std::make_shared<Layer>(
-  //     "terminal",
-  //     Layer::Variables{std::make_shared<Variable>(graph.output(0), nullptr)},
-  //     Layer::Variables{}, Layer::Attributes{});
+  // create layer graph from nodes
+
   // TODO: support multiple outputs
-  std::shared_ptr<Layer> rootLayer = std::make_shared<Layer>(
+  std::map<std::string, std::shared_ptr<Variable>> variableMap;
+
+  auto& nodes = graph.node();
+  std::queue<std::shared_ptr<Layer>> layerQue;
+
+  std::set<const NodeProto*> visitedNodePtr;
+
+  std::shared_ptr<Layer> terminalLayer = std::make_shared<Layer>(
       "terminal",
       Layer::Variables{std::make_shared<Variable>(graph.output(0).name())},
       Layer::Variables{}, Layer::Attributes{});
-  std::map<std::string, std::shared_ptr<Variable>> variableMap;
+  std::shared_ptr<Layer> rootLayer;
 
-  while (true) {
-    auto& nodes = graph.node();
-    auto prevNode = find_if(nodes.begin(), nodes.end(), [&](auto& node) {
-      auto& outputs = node.output();
-      // TODO: care multiple outputs
-      return find_if(outputs.begin(), outputs.end(), [&](auto& out) {
-               return out == rootLayer->inputs[0]->name;
-             }) != outputs.end();
-    });
+  layerQue.push(terminalLayer);
+  while (!layerQue.empty()) {
+    auto currentLayer = layerQue.front();
+    layerQue.pop();
 
-    if (prevNode != nodes.end()) {
-      Layer::Variables inputs, outputs;
-      auto& i = prevNode->input();
-      auto& o = prevNode->output();
+    cout << currentLayer->name << endl;
 
-      auto registerVariable = [&](const std::shared_ptr<Variable> v) {
-        auto it = variableMap.find(v->name);
-        if (it == variableMap.end()) {
-          variableMap.emplace(v->name, v);
-          return v;
-        } else {
-          return it->second;
-        }
-      };
+    int inputIndex = 0;
+    for (auto& input : currentLayer->inputs) {
+      auto prevNode = find_if(nodes.begin(), nodes.end(), [&](auto& node) {
+        auto& outputs = node.output();
+        return find_if(outputs.begin(), outputs.end(), [&](auto& out) {
+                 return out == input->name;
+               }) != outputs.end();
+      });
 
-      std::transform(
-          i.begin(), i.end(), std::back_inserter(inputs), [&](auto& n) {
-            auto it = inputMap.find(n);
-            if (it != inputMap.end()) {
-              auto itt = initMap.find(n);
-              auto tensor =
-                  (itt != initMap.end())
-                      ? itt->second
-                      :
-                      // this tensor is the input of the graph
+      if (prevNode != nodes.end() &&
+          visitedNodePtr.find(&*prevNode) == visitedNodePtr.end()) {
+        visitedNodePtr.insert(&*prevNode);
+
+        // create the previous node
+        Layer::Variables inputs, outputs;
+        auto& i = prevNode->input();
+        auto& o = prevNode->output();
+
+        auto registerVariable = [&](const std::shared_ptr<Variable> v) {
+          auto it = variableMap.find(v->name);
+          if (it == variableMap.end()) {
+            variableMap.emplace(v->name, v);
+            return v;
+          } else {
+            return it->second;
+          }
+        };
+
+        bool isRootLayer = false;
+
+        std::transform(
+            i.begin(), i.end(), std::back_inserter(inputs), [&](auto& n) {
+              auto it = inputMap.find(n);
+              if (it != inputMap.end()) {
+                std::shared_ptr<Tensor> tensor;
+
+                auto itt = initMap.find(n);
+                if (itt != initMap.end()) {
+                  tensor = itt->second;
+                } else {
+                  // this tensor is the input of the graph
+                  tensor =
                       std::make_shared<Tensor>(n, ElementType::Float, inputRaw);
-              return registerVariable(
-                  std::make_shared<Variable>(it->second, tensor));
-            } else {
-              return registerVariable(std::make_shared<Variable>(n));
-            }
-          });
-      std::transform(o.begin(), o.end(), std::back_inserter(outputs),
-                     [&](auto& n) {
-                       return registerVariable(std::make_shared<Variable>(n));
-                     });
+                  isRootLayer = true;
+                }
 
-      auto& a = prevNode->attribute();
-      Layer::Attributes attributes(a.begin(), a.end());
+                return registerVariable(
+                    std::make_shared<Variable>(it->second, tensor));
+              } else {
+                return registerVariable(std::make_shared<Variable>(n));
+              }
+            });
+        std::transform(o.begin(), o.end(), std::back_inserter(outputs),
+                       [&](auto& n) {
+                         return registerVariable(std::make_shared<Variable>(n));
+                       });
 
-      auto prevLayer =
-          make_shared<Layer>(prevNode->op_type(), inputs, outputs, attributes);
-      prevLayer->next = rootLayer;
-      rootLayer = prevLayer;
-    } else {
-      break;
+        auto& a = prevNode->attribute();
+        Layer::Attributes attributes(a.begin(), a.end());
+
+        auto prevLayer = make_shared<Layer>(prevNode->op_type(), inputs,
+                                            outputs, attributes);
+        prevLayer->child = currentLayer;
+        currentLayer->parents.push_back(prevLayer);
+
+        if (isRootLayer) {
+          rootLayer = prevLayer;
+        }
+
+        layerQue.push(prevLayer);
+      }
     }
+    inputIndex++;
   }
 
-  for (auto cur = rootLayer; cur != nullptr; cur = cur->next) {
-    cout << cur->toString() << endl;
+  cout << "finished creating layer graph" << endl;
+
+  // output layers as dot format
+  {
+    std::ofstream dotFile("model.dot");
+    dotFile << "digraph model {\n";
+
+    auto q = [](std::string s) { return '"' + s + '"'; };
+
+    std::queue<std::shared_ptr<Layer>> que;
+    que.push(terminalLayer);
+    while (!que.empty()) {
+      auto cur = que.front();
+      que.pop();
+
+      for (auto layer : cur->parents) {
+        que.push(layer);
+
+        for (auto& i : layer->inputs) {
+          for (auto& o : layer->outputs) {
+            dotFile << q(i->name) << " -> " << q(o->name)
+                    << " [label = " << q(layer->name) << "];\n";
+          }
+        }
+      }
+    }
+
+    dotFile << "}";
+
+    dotFile.close();
   }
-  cout << endl;
 
   // resolve shapes of variables
-  for (auto cur = rootLayer; cur != nullptr; cur = cur->next) {
+  for (auto cur = rootLayer; cur != nullptr; cur = cur->child) {
     if (cur->name == "Reshape") {
       auto& data = cur->inputs[0];
       auto& shape = cur->inputs[1];
@@ -558,15 +628,18 @@ int main(int argc, char const** argv) {
       newShape.w = shapeValue[3];
       reshaped->assignShape(newShape);
     } else if (cur->name == "terminal") {
+      // do nothing
     } else {
       cur->outputs[0]->assignShape(cur->inputs[0]->shape.s);
     }
   }
 
-  for (auto cur = rootLayer; cur != nullptr; cur = cur->next) {
+  for (auto cur = rootLayer; cur != nullptr; cur = cur->child) {
     cout << cur->toString() << endl;
   }
   cout << endl;
+
+  // Initialization of OpenCL
 
   cl_uint numPlatforms = 0;
   cl_platform_id platformId;
@@ -586,11 +659,6 @@ int main(int argc, char const** argv) {
       clCreateCommandQueueWithProperties(context, deviceId, 0, &ret);
   clErrorCheck(ret);
 
-  const int bufferSize = 128;
-  cl_mem buf =
-      clCreateBuffer(context, CL_MEM_READ_WRITE, bufferSize, nullptr, &ret);
-  clErrorCheck(ret);
-
   ifstream kernelIfs("./kernel.cl");
   string kernelStr =
       string(istreambuf_iterator<char>(kernelIfs), istreambuf_iterator<char>());
@@ -605,7 +673,21 @@ int main(int argc, char const** argv) {
   clErrorCheck(
       clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
 
+  // Run the kernel
+
+  // for (auto cur = rootLayer; cur != nullptr; cur = cur->child) {
+  //   cout << cur->toString() << endl;
+  //   if (cur->name == "Reshape") {
+  //
+  //   }
+  // }
+
   cl_kernel kernel = clCreateKernel(program, "hello", &ret);
+  clErrorCheck(ret);
+
+  const int bufferSize = 128;
+  cl_mem buf =
+      clCreateBuffer(context, CL_MEM_READ_WRITE, bufferSize, nullptr, &ret);
   clErrorCheck(ret);
 
   clErrorCheck(clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&buf));
