@@ -580,7 +580,11 @@ int main(int argc, char const** argv) {
       for (auto layer : cur->parents) {
         que.push(layer);
 
-        for (auto& i : layer->inputs) {
+        auto inputs = layer->inputs;
+        if (inputs.size() == 0) {
+          inputs.push_back(std::make_shared<Variable>("(null)"));
+        }
+        for (auto& i : inputs) {
           for (auto& o : layer->outputs) {
             dotFile << q(i->name) << " -> " << q(o->name)
                     << " [label = " << q(layer->name) << "];\n";
