@@ -133,7 +133,7 @@ class Variable {
 
   ElementType elemType;
 
-  vector<TensorShapeProto::Dimension> unresolvedShape;
+  // vector<TensorShapeProto::Dimension> unresolvedShape;
 
   shared_ptr<Tensor> tensor;
 
@@ -149,29 +149,27 @@ class Variable {
         auto& tensorType = it.tensor_type();
 
         elemType = toElementType(tensorType.elem_type());
-        auto& dim = tensorType.shape().dim();
-        unresolvedShape.assign(dim.begin(), dim.end());
 
         // infer shape from tensor
         int varIndex = -1;
         int knownSize = 1;
-        for (int i = 0; i < unresolvedShape.size(); i++) {
-          auto& s = unresolvedShape[i];
-
-          switch (s.value_case()) {
+        int i = 0;
+        for (auto& dim : tensorType.shape().dim()) {
+          switch (dim.value_case()) {
             case TensorShapeProto::Dimension::kDimValue: {
-              int v = s.dim_value();
+              int v = dim.dim_value();
               shape.raw[i] = v;
               knownSize *= v;
               break;
             }
             case TensorShapeProto::Dimension::kDimParam:
-              // s.dim_param();
+              // dim.dim_param();
               varIndex = i;
               break;
             default:
               break;
           }
+          i++;
         }
         if (varIndex >= 0) {
           shape.raw[varIndex] = tensor->size / knownSize;
@@ -187,40 +185,70 @@ class Variable {
     this->tensor = tensor;
   }
 
-  void assignShape(const Shape& shape) { this->shape.s = shape; }
+  // void assignShape(const Shape& shape) { this->shape.s = shape; }
 
-  size_t size() const {
+  size_t elementCount() const {
     size_t s = 1;
     for (int i = 0; i < 4; i++) s *= shape.raw[i];
     return s;
   }
 
+  size_t size() const { return getSize(elemType) * elementCount(); }
+
   string toString() const {
     stringstream ss;
     ss << name << ": [";
-    if (shape.s.x == 0 && shape.s.y == 0 && shape.s.z == 0 && shape.s.w == 0) {
-      ss << "? ";
-      for (auto& dim : unresolvedShape) {
-        switch (dim.value_case()) {
-          case TensorShapeProto::Dimension::kDimValue:
-            ss << dim.dim_value();
-            break;
-          case TensorShapeProto::Dimension::kDimParam:
-            ss << dim.dim_param();
-            break;
-          default:
-            break;
-        }
-        ss << ",";
-      }
-    } else {
-      for (int i = 0; i < 4; i++) {
-        ss << shape.raw[i] << ",";
-      }
+    // if (shape.s.x == 0 && shape.s.y == 0 && shape.s.z == 0 && shape.s.w == 0)
+    // {
+    //   ss << "? ";
+    //   for (auto& dim : unresolvedShape) {
+    //     switch (dim.value_case()) {
+    //       case TensorShapeProto::Dimension::kDimValue:
+    //         ss << dim.dim_value();
+    //         break;
+    //       case TensorShapeProto::Dimension::kDimParam:
+    //         ss << dim.dim_param();
+    //         break;
+    //       default:
+    //         break;
+    //     }
+    //     ss << ",";
+    //   }
+    // } else {
+    for (int i = 0; i < 4; i++) {
+      ss << shape.raw[i] << ",";
     }
+    // }
     ss << "]";
     return ss.str();
   }
+};
+
+class DeviceVariable {
+ public:
+  const std::shared_ptr<Variable> var;
+
+  const size_t size;
+
+  DeviceVariable(std::shared_ptr<Variable> var, cl_context context)
+      : var(var), size(var->size()), context(context) {
+    cl_int ret = 0;
+    buffer =
+        clCreateBuffer(context, CL_MEM_READ_WRITE, var->size(), nullptr, &ret);
+    clErrorCheck(ret);
+  }
+
+  ~DeviceVariable() {
+    if (buffer != nullptr) {
+      clReleaseMemObject(buffer);
+    }
+  }
+
+  cl_mem buffer() const { return buffer; }
+
+ private:
+  cl_context context;
+  cl_mem buffer;
 };
 
 class Layer {
@@ -468,6 +496,8 @@ int main(int argc, char const** argv) {
 
   // TODO: support multiple outputs
   std::map<std::string, std::shared_ptr<Variable>> variableMap;
+  // the input of the model
+  std::shared_ptr<Variable> inputVariable;
 
   auto& nodes = graph.node();
   std::queue<std::shared_ptr<Layer>> layerQue;
@@ -484,8 +514,6 @@ int main(int argc, char const** argv) {
   while (!layerQue.empty()) {
     auto currentLayer = layerQue.front();
     layerQue.pop();
-
-    cout << currentLayer->name << endl;
 
     int inputIndex = 0;
     for (auto& input : currentLayer->inputs) {
@@ -522,19 +550,21 @@ int main(int argc, char const** argv) {
               auto it = inputMap.find(n);
               if (it != inputMap.end()) {
                 std::shared_ptr<Tensor> tensor;
+                std::shared_ptr<Variable> var;
 
                 auto itt = initMap.find(n);
                 if (itt != initMap.end()) {
-                  tensor = itt->second;
+                  var = std::make_shared<Variable>(it->second, itt->second);
                 } else {
                   // this tensor is the input of the graph
-                  tensor =
-                      std::make_shared<Tensor>(n, ElementType::Float, inputRaw);
+                  var = std::make_shared<Variable>(
+                      it->second, std::make_shared<Tensor>(
+                                      n, ElementType::Float, inputRaw));
+                  inputVariable = var;
                   isRootLayer = true;
                 }
 
-                return registerVariable(
-                    std::make_shared<Variable>(it->second, tensor));
+                return registerVariable(var);
               } else {
                 return registerVariable(std::make_shared<Variable>(n));
               }
@@ -599,44 +629,48 @@ int main(int argc, char const** argv) {
   }
 
   // resolve shapes of variables
-  for (auto cur = rootLayer; cur != nullptr; cur = cur->child) {
-    if (cur->name == "Reshape") {
-      auto& data = cur->inputs[0];
-      auto& shape = cur->inputs[1];
-      auto& reshaped = cur->outputs[0];
-
-      auto shapeValue = shape->tensor->getDataAs<ElementType::Int64>();
-      shapeValue.resize(4, 0);
-
-      int varIndex = -1;
-      int knownSize = 1;
-      for (int i = 0; i < shapeValue.size(); i++) {
-        if (shapeValue[i] == 0) {
-          shapeValue[i] = data->shape.raw[i];
-        }
-
-        if (shapeValue[i] == -1) {
-          varIndex = i;
-        } else {
-          knownSize *= shapeValue[i];
-        }
-      }
-      if (varIndex >= 0) {
-        shapeValue[varIndex] = data->size() / knownSize;
-      }
-
-      Shape newShape;
-      newShape.x = shapeValue[0];
-      newShape.y = shapeValue[1];
-      newShape.z = shapeValue[2];
-      newShape.w = shapeValue[3];
-      reshaped->assignShape(newShape);
-    } else if (cur->name == "terminal") {
-      // do nothing
-    } else {
-      cur->outputs[0]->assignShape(cur->inputs[0]->shape.s);
-    }
-  }
+  // Shapes of variables cannot be resolved statically, because arguments of
+  // Reshape may be dynamically.
+  //
+  // for (auto cur = rootLayer; cur != nullptr; cur
+  // = cur->child) {
+  //   if (cur->name == "Reshape") {
+  //     auto& data = cur->inputs[0];
+  //     auto& shape = cur->inputs[1];
+  //     auto& reshaped = cur->outputs[0];
+  //
+  //     auto shapeValue = shape->tensor->getDataAs<ElementType::Int64>();
+  //     shapeValue.resize(4, 0);
+  //
+  //     int varIndex = -1;
+  //     int knownSize = 1;
+  //     for (int i = 0; i < shapeValue.size(); i++) {
+  //       if (shapeValue[i] == 0) {
+  //         shapeValue[i] = data->shape.raw[i];
+  //       }
+  //
+  //       if (shapeValue[i] == -1) {
+  //         varIndex = i;
+  //       } else {
+  //         knownSize *= shapeValue[i];
+  //       }
+  //     }
+  //     if (varIndex >= 0) {
+  //       shapeValue[varIndex] = data->size() / knownSize;
+  //     }
+  //
+  //     Shape newShape;
+  //     newShape.x = shapeValue[0];
+  //     newShape.y = shapeValue[1];
+  //     newShape.z = shapeValue[2];
+  //     newShape.w = shapeValue[3];
+  //     reshaped->assignShape(newShape);
+  //   } else if (cur->name == "terminal") {
+  //     // do nothing
+  //   } else {
+  //     cur->outputs[0]->assignShape(cur->inputs[0]->shape.s);
+  //   }
+  // }
 
   for (auto cur = rootLayer; cur != nullptr; cur = cur->child) {
     cout << cur->toString() << endl;
@@ -659,10 +693,6 @@ int main(int argc, char const** argv) {
       clCreateContext(nullptr, numDevices, &deviceId, nullptr, nullptr, &ret);
   clErrorCheck(ret);
 
-  cl_command_queue queue =
-      clCreateCommandQueueWithProperties(context, deviceId, 0, &ret);
-  clErrorCheck(ret);
-
   ifstream kernelIfs("./kernel.cl");
   string kernelStr =
       string(istreambuf_iterator<char>(kernelIfs), istreambuf_iterator<char>());
@@ -677,14 +707,97 @@ int main(int argc, char const** argv) {
   clErrorCheck(
       clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
 
-  // Run the kernel
+  // Run kernels
 
-  // for (auto cur = rootLayer; cur != nullptr; cur = cur->child) {
-  //   cout << cur->toString() << endl;
-  //   if (cur->name == "Reshape") {
-  //
-  //   }
-  // }
+  cl_command_queue queue =
+      clCreateCommandQueueWithProperties(context, deviceId, 0, &ret);
+  clErrorCheck(ret);
+
+  std::map<std::string, std::shared_ptr<DeviceVariable>> deviceVariableMap;
+
+  auto allocateDeviceVar = [&](std::shared_ptr<Variable> var) {
+    auto it = deviceVariableMap.find(var->name);
+    if (it != deviceVariableMap.end()) {
+      return *it;
+    } else {
+      auto dv = std::make_shared<DeviceVariable>(var, context);
+      deviceVariableMap.emplace(var->name, dv);
+      return dv;
+    }
+  };
+
+  auto writeBuffer = [&](cl_command_queue queue,
+                         std::shared_ptr<DeviceVariable> dest,
+                         const std::string& src) {
+    assert(dest->size == src.size());
+    clErrorCheck(clEnqueueWriteBuffer(queue, dest->buffer(), CL_TRUE, 0,
+                                      dest->size, src.data(), 0, nullptr,
+                                      nullptr));
+  };
+
+  auto readBuffer = [&](cl_command_queue queue, std::string& dest,
+                        std::shared_ptr<DeviceVariable> src, ) {
+    assert(dest->size == src.size());
+    clErrorCheck(clEnqueueWriteBuffer(queue, src.data(), CL_TRUE, 0, dest->size,
+                                      dest->buffer(), 0, nullptr, nullptr));
+  };
+
+  auto inputDVariable = allocateDeviceVar(inputVariable);
+  writeBuffer(queue, inputDVariable, inputRaw);
+
+  cl_kernel kernel = clCreateKernel(program, "twice", &ret);
+  clErrorCheck(ret);
+
+  using DeviceVariables = std::vector<std::shared_ptr<DeviceVariable>>;
+  {
+    auto fstLayer = rootLayer;
+    cout << "Run " << fstLayer->name << endl;
+
+    DeviceVariables dinputs;
+    for (auto& input : fstLayer->inputs) {
+      auto dv = allocateDeviceVar(input);
+      dinputs.push_back(dv);
+      if (dv->var->tensor) {
+        writeBuffer(queue, dv, dv->var->tensor->raw);
+      } else {
+        // It should be done to writeBuffer to dv.
+      }
+
+      clErrorCheck(
+          clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&dv->buffer()));
+    }
+    DeviceVariables doutputs;
+    for (auto& output : fstLayer->outputs) {
+      auto dv = allocateDeviceVar(output);
+      doutputs.push_back(dv);
+
+      clErrorCheck(
+          clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&dv->buffer()));
+    }
+
+    const size_t globalSize[] = {dinputs[0]->var->elementCount()};
+    const size_t localSize[] = {1};
+    clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize,
+                                        localSize, 0, nullptr, nullptr));
+
+    string str(28 * 28, '\0');
+    readBuffer(queue, str, doutputs[0]);
+
+    cout << "[";
+    for (int i = 0; i < str.size(); i += 4) {
+      int v = 0;
+      for (int j = 0; j < 4; j++) {
+        v |= (unsigned char)raw[i + j] << (j * 4);
+      }
+      cout << *reinterpret_cast<float*>(&v) << " ";
+
+      if (i > 40) {
+        cout << "...";
+        break;
+      }
+    }
+    cout << "]" << endl;
+  }
 
   cl_kernel kernel = clCreateKernel(program, "hello", &ret);
   clErrorCheck(ret);
