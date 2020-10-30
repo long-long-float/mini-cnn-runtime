@@ -16,7 +16,7 @@ __kernel void hello(__global char* string)
     string[13] = '\0';
 }
 
-__kernel void twice(float* in, __global float* out)
+__kernel void Reshape(__global float* in, __global int* shape, __global float* out)
 {
     int x = get_global_id(0);
     out[x] = in[x] * 2.0f;

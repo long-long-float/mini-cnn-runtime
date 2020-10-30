@@ -18,6 +18,19 @@ using namespace onnx;
 template <typename... T>
 struct TypeDisplayer;
 
+class CLError {
+ public:
+  cl_int code;
+  CLError(cl_int code) : code(code) {}
+};
+
+cl_int clErrorCheck(cl_int result) {
+  if (result != CL_SUCCESS) {
+    throw CLError(result);
+  }
+  return result;
+}
+
 struct Shape {
   int x, y, z, w;
 
@@ -132,9 +145,6 @@ class Variable {
   } shape;
 
   ElementType elemType;
-
-  // vector<TensorShapeProto::Dimension> unresolvedShape;
-
   shared_ptr<Tensor> tensor;
 
   Variable(const string& name) : name(name) {
@@ -187,13 +197,23 @@ class Variable {
 
   // void assignShape(const Shape& shape) { this->shape.s = shape; }
 
+  size_t dim() const {
+    size_t d = 0;
+    for (; d < 4 && shape.raw[d] != 0; d++)
+      ;
+    return d;
+  }
+
   size_t elementCount() const {
     size_t s = 1;
-    for (int i = 0; i < 4; i++) s *= shape.raw[i];
+    for (int i = 0; i < dim(); i++) s *= shape.raw[i];
     return s;
   }
 
-  size_t size() const { return getSize(elemType) * elementCount(); }
+  size_t size() const {
+    // TODO: Ensure elemType is valid
+    return getSize(elemType) * elementCount();
+  }
 
   string toString() const {
     stringstream ss;
@@ -233,22 +253,24 @@ class DeviceVariable {
   DeviceVariable(std::shared_ptr<Variable> var, cl_context context)
       : var(var), size(var->size()), context(context) {
     cl_int ret = 0;
-    buffer =
+    _buffer =
         clCreateBuffer(context, CL_MEM_READ_WRITE, var->size(), nullptr, &ret);
     clErrorCheck(ret);
   }
 
   ~DeviceVariable() {
-    if (buffer != nullptr) {
-      clReleaseMemObject(buffer);
+    if (_buffer != nullptr) {
+      clReleaseMemObject(_buffer);
     }
   }
 
-  cl_mem buffer() const { return buffer; }
+  cl_mem buffer() const { return _buffer; }
+  // For clSetKernelArg
+  void* bufferPtr() const { return (void*)&_buffer; }
 
  private:
   cl_context context;
-  cl_mem buffer;
+  cl_mem _buffer;
 };
 
 class Layer {
@@ -352,7 +374,7 @@ void printTensor(const TensorProto& tensor) {
       for (int i = 0; i < raw.size(); i += 4) {
         int v = 0;
         for (int j = 0; j < 4; j++) {
-          v |= (unsigned char)raw[i + j] << (j * 4);
+          v |= (unsigned char)raw[i + j] << (j * 8);
         }
         cout << *reinterpret_cast<float*>(&v) << " ";
 
@@ -391,19 +413,6 @@ string toString(const AttributeProto& attr) {
       break;
   }
   return ss.str();
-}
-
-class CLError {
- public:
-  cl_int code;
-  CLError(cl_int code) : code(code) {}
-};
-
-cl_int clErrorCheck(cl_int result) {
-  if (result != CL_SUCCESS) {
-    throw CLError(result);
-  }
-  return result;
 }
 
 int main(int argc, char const** argv) {
@@ -484,11 +493,10 @@ int main(int argc, char const** argv) {
   }
   std::string inputRaw;
   for (auto& v : inputData) {
-    size_t elemSize = sizeof(decltype(inputData)::value_type);
-    int iv = 0;
-    std::memcpy(&iv, &v, elemSize);
+    size_t elemSize = sizeof(float);
+    int iv = *reinterpret_cast<int*>(&v);
     for (int i = 0; i < elemSize; i++) {
-      inputRaw.push_back(iv & (0xffu << (i * 8)));
+      inputRaw.push_back(iv >> (i * 8) & 0xffu);
     }
   }
 
@@ -704,8 +712,32 @@ int main(int argc, char const** argv) {
       context, 1, (const char**)&strptr, &kernelSize, &ret);
   clErrorCheck(ret);
 
-  clErrorCheck(
-      clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
+  try {
+    clErrorCheck(
+        clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
+  } catch (const CLError& ex) {
+    if (ex.code == CL_BUILD_PROGRAM_FAILURE) {
+      size_t logSize = 0;
+
+      clErrorCheck(clGetProgramBuildInfo(program, deviceId,
+                                           CL_PROGRAM_BUILD_LOG, 0, nullptr,
+                                           &logSize));
+
+      std::vector<char> log(logSize + 1);
+      clErrorCheck(clGetProgramBuildInfo(program, deviceId,
+                                           CL_PROGRAM_BUILD_LOG, logSize,
+                                           log.data(), nullptr));
+      log[logSize] = '\0';
+
+      std::cout << "Build error!" << std::endl;
+      std::cout << log.data() << std::endl;
+
+      return -1;
+    }
+    else {
+      std::rethrow_exception(std::current_exception());
+    }
+  }
 
   // Run kernels
 
@@ -718,7 +750,7 @@ int main(int argc, char const** argv) {
   auto allocateDeviceVar = [&](std::shared_ptr<Variable> var) {
     auto it = deviceVariableMap.find(var->name);
     if (it != deviceVariableMap.end()) {
-      return *it;
+      return it->second;
     } else {
       auto dv = std::make_shared<DeviceVariable>(var, context);
       deviceVariableMap.emplace(var->name, dv);
@@ -735,17 +767,19 @@ int main(int argc, char const** argv) {
                                       nullptr));
   };
 
-  auto readBuffer = [&](cl_command_queue queue, std::string& dest,
-                        std::shared_ptr<DeviceVariable> src, ) {
-    assert(dest->size == src.size());
-    clErrorCheck(clEnqueueWriteBuffer(queue, src.data(), CL_TRUE, 0, dest->size,
-                                      dest->buffer(), 0, nullptr, nullptr));
+  auto readBuffer = [&](cl_command_queue queue,
+                        std::vector<unsigned char>& dest,
+                        std::shared_ptr<DeviceVariable> src) {
+    assert(dest.size() == src->size);
+    clErrorCheck(clEnqueueReadBuffer(queue, src->buffer(), CL_TRUE, 0,
+                                     dest.size(), dest.data(), 0, nullptr,
+                                     nullptr));
   };
 
   auto inputDVariable = allocateDeviceVar(inputVariable);
   writeBuffer(queue, inputDVariable, inputRaw);
 
-  cl_kernel kernel = clCreateKernel(program, "twice", &ret);
+  cl_kernel kernel = clCreateKernel(program, "Reshape", &ret);
   clErrorCheck(ret);
 
   using DeviceVariables = std::vector<std::shared_ptr<DeviceVariable>>;
@@ -753,8 +787,47 @@ int main(int argc, char const** argv) {
     auto fstLayer = rootLayer;
     cout << "Run " << fstLayer->name << endl;
 
+    if (fstLayer->name == "Reshape") {
+      auto& data = fstLayer->inputs[0];
+      auto& shape = fstLayer->inputs[1];
+      auto& reshaped = fstLayer->outputs[0];
+
+      // TODO: Read tensor from device memory
+      auto shapeValue = shape->tensor->getDataAs<ElementType::Int64>();
+      shapeValue.resize(4, 0);
+
+      int varIndex = -1;
+      int knownSize = 1;
+      for (int i = 0; i < shapeValue.size(); i++) {
+        if (shapeValue[i] == 0) {
+          shapeValue[i] = data->shape.raw[i];
+        }
+
+        if (shapeValue[i] == -1) {
+          varIndex = i;
+        } else {
+          knownSize *= shapeValue[i];
+        }
+      }
+      if (varIndex >= 0) {
+        shapeValue[varIndex] = data->elementCount() / knownSize;
+      }
+
+      Shape newShape;
+      newShape.x = shapeValue[0];
+      newShape.y = shapeValue[1];
+      newShape.z = shapeValue[2];
+      newShape.w = shapeValue[3];
+
+      reshaped->shape.s = newShape;
+      reshaped->elemType = data->elemType;
+    }
+
+    int argCount = 0;
+
     DeviceVariables dinputs;
     for (auto& input : fstLayer->inputs) {
+      cout << input->toString() << endl;
       auto dv = allocateDeviceVar(input);
       dinputs.push_back(dv);
       if (dv->var->tensor) {
@@ -763,16 +836,15 @@ int main(int argc, char const** argv) {
         // It should be done to writeBuffer to dv.
       }
 
-      clErrorCheck(
-          clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&dv->buffer()));
+      clErrorCheck(clSetKernelArg(kernel, argCount++, sizeof(cl_mem), dv->bufferPtr()));
     }
     DeviceVariables doutputs;
     for (auto& output : fstLayer->outputs) {
+      cout << output->toString() << endl;
       auto dv = allocateDeviceVar(output);
       doutputs.push_back(dv);
 
-      clErrorCheck(
-          clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&dv->buffer()));
+      clErrorCheck(clSetKernelArg(kernel, argCount++, sizeof(cl_mem), dv->bufferPtr()));
     }
 
     const size_t globalSize[] = {dinputs[0]->var->elementCount()};
@@ -780,14 +852,14 @@ int main(int argc, char const** argv) {
     clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize,
                                         localSize, 0, nullptr, nullptr));
 
-    string str(28 * 28, '\0');
-    readBuffer(queue, str, doutputs[0]);
+    std::vector<unsigned char> res(28 * 28 * sizeof(float), 0);
+    readBuffer(queue, res, doutputs[0]);
 
     cout << "[";
-    for (int i = 0; i < str.size(); i += 4) {
+    for (int i = 0; i < res.size(); i += 4) {
       int v = 0;
       for (int j = 0; j < 4; j++) {
-        v |= (unsigned char)raw[i + j] << (j * 4);
+        v |= res[i + j] << (j * 8);
       }
       cout << *reinterpret_cast<float*>(&v) << " ";
 
@@ -799,33 +871,11 @@ int main(int argc, char const** argv) {
     cout << "]" << endl;
   }
 
-  cl_kernel kernel = clCreateKernel(program, "hello", &ret);
-  clErrorCheck(ret);
-
-  const int bufferSize = 128;
-  cl_mem buf =
-      clCreateBuffer(context, CL_MEM_READ_WRITE, bufferSize, nullptr, &ret);
-  clErrorCheck(ret);
-
-  clErrorCheck(clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&buf));
-
-  const size_t globalSize[] = {1};
-  const size_t localSize[] = {1};
-  clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize,
-                                      localSize, 0, nullptr, nullptr));
-
-  char str[128] = {0};
-  clErrorCheck(clEnqueueReadBuffer(queue, buf, CL_TRUE, 0, bufferSize, str, 0,
-                                   nullptr, nullptr));
-
-  cout << str << endl;
-
   // TODO: Release there objects even when an error is occured.
   clErrorCheck(clFlush(queue));
   clErrorCheck(clFinish(queue));
   clErrorCheck(clReleaseKernel(kernel));
   clErrorCheck(clReleaseProgram(program));
-  clErrorCheck(clReleaseMemObject(buf));
   clErrorCheck(clReleaseCommandQueue(queue));
   clErrorCheck(clReleaseContext(context));
 
