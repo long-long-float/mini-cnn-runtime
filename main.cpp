@@ -36,6 +36,13 @@ struct Shape {
   int x, y, z, w;
 
   // Shape() : x(0), y(0), z(0), w(0) {}
+
+  void set(int _x, int _y, int _z, int _w) {
+    x = _x;
+    y = _y;
+    z = _z;
+    w = _w;
+  }
 };
 
 enum class ElementType {
@@ -774,8 +781,16 @@ int main(int argc, char const** argv) {
 
   // Run kernels
 
+  // It's enabled at higher than OpenCL 2.0
+  // cl_queue_properties prop[] = {
+  //   CL_QUEUE_PROPERTIES | CL_QUEUE_PROFILING_ENABLE,
+  //   0
+  // };
+  // cl_command_queue queue =
+  //     clCreateCommandQueueWithProperties(context, deviceId, prop, &ret);
+  // clErrorCheck(ret);
   cl_command_queue queue =
-      clCreateCommandQueueWithProperties(context, deviceId, 0, &ret);
+      clCreateCommandQueue(context, deviceId, CL_QUEUE_PROFILING_ENABLE, &ret);
   clErrorCheck(ret);
 
   std::map<std::string, std::shared_ptr<DeviceVariable>> deviceVariableMap;
@@ -824,16 +839,17 @@ int main(int argc, char const** argv) {
 
   // Create a MatMul layer for testing
   Layer::Variables mmInput, mmOutput;
-  const int matW = 16;
-  const int matH = 8;
+  Shape shapeA, shapeB;
+  shapeA.set(500, 500, 0, 0);
+  shapeB.set(500, 500, 0, 0);
   std::string matA, matB;
   {
     std::vector<float> inputDataA;
     std::vector<float> inputDataB;
-    for (int i = 0; i < matW * matH; i++) {
+    for (int i = 0; i < shapeA.x * shapeA.y; i++) {
       inputDataA.push_back(i);
     }
-    for (int i = 0; i < matW * 10; i++) {
+    for (int i = 0; i < shapeB.x * shapeB.y; i++) {
       inputDataB.push_back(i);
     }
 
@@ -846,22 +862,10 @@ int main(int argc, char const** argv) {
   auto varB = std::make_shared<Variable>("B");
   varA->elemType = ElementType::Float;
   varA->tensor = tensorA;
-  {
-    Shape s;
-    s.x = matW;
-    s.y = matH;
-    s.z = s.w = 0;
-    varA->shape.s = s;
-  }
+  varA->shape.s = shapeA;
   varB->elemType = ElementType::Float;
   varB->tensor = tensorB;
-  {
-    Shape s;
-    s.x = 10;  // matH;
-    s.y = matW;
-    s.z = s.w = 0;
-    varB->shape.s = s;
-  }
+  varB->shape.s = shapeB;
   mmInput.push_back(varA);
   mmInput.push_back(varB);
   mmOutput.push_back(std::make_shared<Variable>("Y"));
@@ -972,14 +976,27 @@ int main(int argc, char const** argv) {
     // const size_t globalSize[] = {dinputs[0]->var->elementCount()};
     const size_t globalSize[] = {1};
     const size_t localSize[] = {1};
+    cl_event handler;
     clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize,
-                                        localSize, 0, nullptr, nullptr));
+                                        localSize, 0, nullptr, &handler));
+
+    clErrorCheck(clWaitForEvents(1, &handler));
+    {
+      cl_ulong start, end;
+      clErrorCheck(clGetEventProfilingInfo(handler, CL_PROFILING_COMMAND_START,
+                                           sizeof(cl_ulong), &start, NULL));
+      clErrorCheck(clGetEventProfilingInfo(handler, CL_PROFILING_COMMAND_END,
+                                           sizeof(cl_ulong), &end, NULL));
+      std::cout << "execution time: " << (end - start) / (1000 * 1000) << "(ms)"
+                << endl;
+    }
+    clErrorCheck(clReleaseEvent(handler));
 
     auto out = doutputs[0];
     std::vector<unsigned char> res(out->size, 0);
     readBuffer(queue, res, out);
 
-    printTensor(res, out->var->elemType, out->var->shape.s);
+    // printTensor(res, out->var->elemType, out->var->shape.s);
 
     ii++;
   }
@@ -997,4 +1014,3 @@ int main(int argc, char const** argv) {
 
   return 0;
 }
-
