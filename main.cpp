@@ -837,11 +837,18 @@ int main(int argc, char const** argv) {
   createKernel("Conv");
   createKernel("MatMul");
 
+  bool debug = false;
+
   // Create a MatMul layer for testing
   Layer::Variables mmInput, mmOutput;
   Shape shapeA, shapeB;
-  shapeA.set(500, 500, 0, 0);
-  shapeB.set(500, 500, 0, 0);
+  if (debug) {
+    shapeA.set(32, 16, 0, 0);
+    shapeB.set(16, 32, 0, 0);
+  } else {
+    shapeA.set(512, 512, 0, 0);
+    shapeB.set(512, 512, 0, 0);
+  }
   std::string matA, matB;
   {
     std::vector<float> inputDataA;
@@ -873,8 +880,8 @@ int main(int argc, char const** argv) {
       std::make_shared<Layer>("MatMul", mmInput, mmOutput, Layer::Attributes{});
   rootLayer = mmLayer;
 
-  printTensor(matA, varA->elemType, varA->shape.s);
-  printTensor(matB, varB->elemType, varB->shape.s);
+  // printTensor(matA, varA->elemType, varA->shape.s);
+  // printTensor(matB, varB->elemType, varB->shape.s);
 
   using DeviceVariables = std::vector<std::shared_ptr<DeviceVariable>>;
   int ii = 0;
@@ -996,7 +1003,14 @@ int main(int argc, char const** argv) {
     std::vector<unsigned char> res(out->size, 0);
     readBuffer(queue, res, out);
 
-    // printTensor(res, out->var->elemType, out->var->shape.s);
+    std::ofstream ofs("output.bin", std::ios::binary);
+    for (auto v : res) {
+      ofs << v;
+    }
+
+    if (debug) {
+      printTensor(res, out->var->elemType, out->var->shape.s);
+    }
 
     ii++;
   }
