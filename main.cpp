@@ -45,57 +45,48 @@ struct Shape {
   }
 };
 
-enum class ElementType {
-  Float,
-  Int64,
-  Unknown,
-};
+using ElementType = TensorProto::DataType;
 
-template <ElementType T>
+template <TensorProto::DataType T>
 struct ElementType2Cpp {
   using t = void;
 };
 template <>
-struct ElementType2Cpp<ElementType::Float> {
+struct ElementType2Cpp<TensorProto::FLOAT> {
   using t = float;
 };
 template <>
-struct ElementType2Cpp<ElementType::Int64> {
+struct ElementType2Cpp<TensorProto::INT32> {
+  using t = long;
+};
+template <>
+struct ElementType2Cpp<TensorProto::INT64> {
+  using t = long long;
+};
+template <>
+struct ElementType2Cpp<TensorProto::BOOL> {
   using t = long long;
 };
 
 size_t getSize(ElementType type) {
+#define DECL_CASE(ty)   \
+  case TensorProto::ty: \
+    return sizeof(ElementType2Cpp<TensorProto::ty>::t);
+
   switch (type) {
-    case ElementType::Float:
-      return sizeof(ElementType2Cpp<ElementType::Float>::t);
-    case ElementType::Int64:
-      return sizeof(ElementType2Cpp<ElementType::Int64>::t);
+    DECL_CASE(FLOAT)
+    DECL_CASE(INT32)
+    DECL_CASE(INT64)
+    DECL_CASE(BOOL)
     default:
+      throw runtime_error("unsupported type: " + to_string(type));
       return 0;
   }
+
+#undef DECL_CASE
 }
 
-ElementType toElementType(int type) {
-  switch (type) {
-    case TensorProto::FLOAT:
-      return ElementType::Float;
-    case TensorProto::INT64:
-      return ElementType::Int64;
-    default:
-      return ElementType::Unknown;
-  }
-}
-
-std::string toDataTypeString(int type) {
-  switch (type) {
-    case TensorProto::FLOAT:
-      return "FLOAT";
-    case TensorProto::INT64:
-      return "INT64";
-    default:
-      return "unknown";
-  }
-}
+ElementType toElementType(int type) { return static_cast<ElementType>(type); }
 
 class Tensor {
  public:
@@ -330,7 +321,8 @@ void printValueInfo(const ValueInfoProto& info) {
   switch (it.value_case()) {
     case TypeProto::kTensorType: {
       auto& tensorType = it.tensor_type();
-      cout << "(" << toDataTypeString(tensorType.elem_type()) << ", [";
+      cout << "(" << TensorProto::DataType_Name(tensorType.elem_type())
+           << ", [";
       for (auto& dim : tensorType.shape().dim()) {
         switch (dim.value_case()) {
           case TensorShapeProto::Dimension::kDimValue:
@@ -609,7 +601,7 @@ int main(int argc, char const** argv) {
                   // this tensor is the input of the graph
                   var = std::make_shared<Variable>(
                       it->second, std::make_shared<Tensor>(
-                                      n, ElementType::Float, inputRaw));
+                                      n, TensorProto::FLOAT, inputRaw));
                   inputVariable = var;
                   isRootLayer = true;
                 }
@@ -863,14 +855,14 @@ int main(int argc, char const** argv) {
     matA = vecToStr(inputDataA);
     matB = vecToStr(inputDataB);
   }
-  auto tensorA = std::make_shared<Tensor>("A", ElementType::Float, matA);
-  auto tensorB = std::make_shared<Tensor>("B", ElementType::Float, matB);
+  auto tensorA = std::make_shared<Tensor>("A", TensorProto::FLOAT, matA);
+  auto tensorB = std::make_shared<Tensor>("B", TensorProto::FLOAT, matB);
   auto varA = std::make_shared<Variable>("A");
   auto varB = std::make_shared<Variable>("B");
-  varA->elemType = ElementType::Float;
+  varA->elemType = TensorProto::FLOAT;
   varA->tensor = tensorA;
   varA->shape.s = shapeA;
-  varB->elemType = ElementType::Float;
+  varB->elemType = TensorProto::FLOAT;
   varB->tensor = tensorB;
   varB->shape.s = shapeB;
   mmInput.push_back(varA);
@@ -899,7 +891,7 @@ int main(int argc, char const** argv) {
       auto& reshaped = currentLayer->outputs[0];
 
       // TODO: Read tensor from device memory
-      auto shapeValue = shape->tensor->getDataAs<ElementType::Int64>();
+      auto shapeValue = shape->tensor->getDataAs<TensorProto::INT64>();
       shapeValue.resize(4, 0);
 
       int varIndex = -1;
