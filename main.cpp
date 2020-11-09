@@ -88,6 +88,9 @@ size_t getSize(ElementType type) {
 
 ElementType toElementType(int type) { return static_cast<ElementType>(type); }
 
+template <class R>
+void printTensor(const R& raw, ElementType elemType, Shape shape);
+
 class Tensor {
  public:
   std::string name;
@@ -315,6 +318,253 @@ class Layer {
   }
 };
 
+class OpenCLRuntime {
+ private:
+  cl_uint numPlatforms = 0;
+  cl_platform_id platformId;
+  cl_device_id deviceId;
+  cl_uint numDevices = 0;
+  cl_context context;
+  cl_program program;
+  cl_command_queue queue;
+
+  std::map<std::string, cl_kernel> kernels;
+
+  std::map<std::string, std::shared_ptr<DeviceVariable>> deviceVariableMap;
+
+ public:
+  OpenCLRuntime(const std::string& kernelPath) {
+    clErrorCheck(clGetPlatformIDs(1, &platformId, &numPlatforms));
+    clErrorCheck(clGetDeviceIDs(platformId, CL_DEVICE_TYPE_DEFAULT, 1,
+                                &deviceId, &numDevices));
+
+    cl_int ret;
+    context =
+        clCreateContext(nullptr, numDevices, &deviceId, nullptr, nullptr, &ret);
+    clErrorCheck(ret);
+
+    ifstream kernelIfs(kernelPath);
+    string kernelStr = string(istreambuf_iterator<char>(kernelIfs),
+                              istreambuf_iterator<char>());
+    char* strptr =
+        const_cast<char*>(kernelStr.c_str());  // strptr must not be rewrote.
+    const size_t kernelSize = kernelStr.size();
+
+    program = clCreateProgramWithSource(context, 1, (const char**)&strptr,
+                                        &kernelSize, &ret);
+    clErrorCheck(ret);
+
+    clErrorCheck(
+        clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
+
+    // It's enabled at higher than OpenCL 2.0
+    // cl_queue_properties prop[] = {
+    //   CL_QUEUE_PROPERTIES | CL_QUEUE_PROFILING_ENABLE,
+    //   0
+    // };
+    // cl_command_queue queue =
+    //     clCreateCommandQueueWithProperties(context, deviceId, prop, &ret);
+    // clErrorCheck(ret);
+    queue = clCreateCommandQueue(context, deviceId, CL_QUEUE_PROFILING_ENABLE,
+                                 &ret);
+    clErrorCheck(ret);
+  }
+
+  ~OpenCLRuntime() {
+    clErrorCheck(clFlush(queue));
+    clErrorCheck(clFinish(queue));
+    clErrorCheck(clReleaseCommandQueue(queue));
+
+    for (auto p : kernels) {
+      clErrorCheck(clReleaseKernel(p.second));
+    }
+
+    clErrorCheck(clReleaseProgram(program));
+    clErrorCheck(clReleaseContext(context));
+  }
+
+  void writeBuffer(std::shared_ptr<DeviceVariable> dest,
+                   const std::string& src) {
+    assert(dest->size == src.size());
+    clErrorCheck(clEnqueueWriteBuffer(queue, dest->buffer(), CL_TRUE, 0,
+                                      dest->size, src.data(), 0, nullptr,
+                                      nullptr));
+  }
+
+  void readBuffer(std::vector<unsigned char>& dest,
+                  std::shared_ptr<DeviceVariable> src) {
+    assert(dest.size() == src->size);
+    clErrorCheck(clEnqueueReadBuffer(queue, src->buffer(), CL_TRUE, 0,
+                                     dest.size(), dest.data(), 0, nullptr,
+                                     nullptr));
+  }
+
+  void createKernel(const std::string& name) {
+    cl_int ret;
+    kernels.emplace(name, clCreateKernel(program, name.c_str(), &ret));
+    clErrorCheck(ret);
+  }
+
+  std::shared_ptr<DeviceVariable> allocateDeviceVar(
+      std::shared_ptr<Variable> var) {
+    auto it = deviceVariableMap.find(var->name);
+    if (it != deviceVariableMap.end()) {
+      return it->second;
+    } else {
+      auto dv = std::make_shared<DeviceVariable>(var, context);
+      deviceVariableMap.emplace(var->name, dv);
+      return dv;
+    }
+  }
+
+  void runLayers(std::shared_ptr<Layer> rootLayer) {
+    using DeviceVariables = std::vector<std::shared_ptr<DeviceVariable>>;
+    int ii = 0;
+    for (auto currentLayer = rootLayer; currentLayer != nullptr;
+         currentLayer = currentLayer->child) {
+      if (ii >= 1) break;
+
+      const std::string layerName = currentLayer->name;
+
+      cout << "Run " << layerName << endl;
+
+      if (layerName == "Reshape") {
+        auto& data = currentLayer->inputs[0];
+        auto& shape = currentLayer->inputs[1];
+        auto& reshaped = currentLayer->outputs[0];
+
+        // TODO: Read tensor from device memory
+        auto shapeValue = shape->tensor->getDataAs<TensorProto::INT64>();
+        shapeValue.resize(4, 0);
+
+        int varIndex = -1;
+        int knownSize = 1;
+        for (int i = 0; i < shapeValue.size(); i++) {
+          if (shapeValue[i] == 0) {
+            shapeValue[i] = data->shape.raw[i];
+          }
+
+          if (shapeValue[i] == -1) {
+            varIndex = i;
+          } else {
+            knownSize *= shapeValue[i];
+          }
+        }
+        if (varIndex >= 0) {
+          shapeValue[varIndex] = data->elementCount() / knownSize;
+        }
+
+        Shape newShape;
+        newShape.x = shapeValue[0];
+        newShape.y = shapeValue[1];
+        newShape.z = shapeValue[2];
+        newShape.w = shapeValue[3];
+
+        reshaped->shape.s = newShape;
+        reshaped->elemType = data->elemType;
+      } else if (layerName == "Conv") {
+        auto& X = currentLayer->inputs[0];
+        auto& W = currentLayer->inputs[1];
+        auto& B = currentLayer->inputs[2];
+        auto& Y = currentLayer->outputs[0];
+
+      } else if (layerName == "MatMul") {
+        auto& A = currentLayer->inputs[0];
+        auto& B = currentLayer->inputs[1];
+        auto& Y = currentLayer->outputs[0];
+
+        Shape newShape;
+        newShape.x = B->shape.s.x;
+        newShape.y = A->shape.s.y;
+        newShape.z = A->shape.s.z;
+        newShape.w = A->shape.s.w;
+
+        Y->shape.s = newShape;
+        Y->elemType = A->elemType;
+      }
+
+      auto kernel = kernels[layerName];
+
+      int argCount = 0;
+
+      DeviceVariables dinputs;
+      for (auto& input : currentLayer->inputs) {
+        cout << input->toString() << endl;
+        auto dv = allocateDeviceVar(input);
+        dinputs.push_back(dv);
+        if (dv->var->tensor) {
+          writeBuffer(dv, dv->var->tensor->raw);
+        } else {
+          // It should be done to writeBuffer to dv.
+        }
+
+        clErrorCheck(clSetKernelArg(kernel, argCount++, sizeof(cl_mem),
+                                    dv->bufferPtr()));
+        clErrorCheck(
+            clSetKernelArg(kernel, argCount++, sizeof(Shape), &dv->var->shape));
+      }
+      DeviceVariables doutputs;
+      for (auto& output : currentLayer->outputs) {
+        cout << output->toString() << endl;
+        auto dv = allocateDeviceVar(output);
+        doutputs.push_back(dv);
+
+        clErrorCheck(clSetKernelArg(kernel, argCount++, sizeof(cl_mem),
+                                    dv->bufferPtr()));
+        clErrorCheck(
+            clSetKernelArg(kernel, argCount++, sizeof(Shape), &dv->var->shape));
+      }
+
+      // const size_t globalSize[] = {dinputs[0]->var->elementCount()};
+      const size_t globalSize[] = {1};
+      const size_t localSize[] = {1};
+      cl_event handler;
+      clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize,
+                                          localSize, 0, nullptr, &handler));
+
+      clErrorCheck(clWaitForEvents(1, &handler));
+      {
+        cl_ulong start, end;
+        clErrorCheck(clGetEventProfilingInfo(handler,
+                                             CL_PROFILING_COMMAND_START,
+                                             sizeof(cl_ulong), &start, NULL));
+        clErrorCheck(clGetEventProfilingInfo(handler, CL_PROFILING_COMMAND_END,
+                                             sizeof(cl_ulong), &end, NULL));
+        std::cout << "execution time: " << (end - start) / (1000 * 1000)
+                  << "(ms)" << endl;
+      }
+      clErrorCheck(clReleaseEvent(handler));
+
+      auto out = doutputs[0];
+      std::vector<unsigned char> res(out->size, 0);
+      readBuffer(res, out);
+
+      std::ofstream ofs("output.bin", std::ios::binary);
+      for (auto v : res) {
+        ofs << v;
+      }
+
+      printTensor(res, out->var->elemType, out->var->shape.s);
+
+      ii++;
+    }
+  }
+
+  std::string getBuildLog() {
+    size_t logSize = 0;
+
+    clErrorCheck(clGetProgramBuildInfo(program, deviceId, CL_PROGRAM_BUILD_LOG,
+                                       0, nullptr, &logSize));
+
+    std::vector<char> log(logSize + 1);
+    clErrorCheck(clGetProgramBuildInfo(program, deviceId, CL_PROGRAM_BUILD_LOG,
+                                       logSize, log.data(), nullptr));
+    log[logSize] = '\0';
+
+    return std::string(log.data(), log.size() - 1);
+  }
+};
+
 void printValueInfo(const ValueInfoProto& info) {
   cout << info.name() << ", type = ";
   auto& it = info.type();
@@ -443,8 +693,18 @@ void printTensor(const R& raw, ElementType elemType, Shape shape) {
         v |= c << (i * 8);
       }
       cout << std::setw(3) << *reinterpret_cast<float*>(&v) << " ";
+
+      if (x > 10) {
+        cout << "...";
+        break;
+      }
     }
     cout << "]" << endl;
+
+    if (y > 10) {
+      cout << "..." << endl;
+      break;
+    }
   }
   cout << "]" << endl;
 }
@@ -719,304 +979,75 @@ int main(int argc, char const** argv) {
   }
   cout << endl;
 
-  // Initialization of OpenCL
-
-  cl_uint numPlatforms = 0;
-  cl_platform_id platformId;
-  cl_device_id deviceId;
-  cl_uint numDevices = 0;
-
-  clErrorCheck(clGetPlatformIDs(1, &platformId, &numPlatforms));
-  clErrorCheck(clGetDeviceIDs(platformId, CL_DEVICE_TYPE_DEFAULT, 1, &deviceId,
-                              &numDevices));
-
-  cl_int ret;
-  cl_context context =
-      clCreateContext(nullptr, numDevices, &deviceId, nullptr, nullptr, &ret);
-  clErrorCheck(ret);
-
-  ifstream kernelIfs("./kernel.cl");
-  string kernelStr =
-      string(istreambuf_iterator<char>(kernelIfs), istreambuf_iterator<char>());
-  char* strptr =
-      const_cast<char*>(kernelStr.c_str());  // strptr must not be rewrote.
-  const size_t kernelSize = kernelStr.size();
-
-  cl_program program = clCreateProgramWithSource(
-      context, 1, (const char**)&strptr, &kernelSize, &ret);
-  clErrorCheck(ret);
-
+  std::unique_ptr<OpenCLRuntime> runtime;
   try {
-    clErrorCheck(
-        clBuildProgram(program, 1, &deviceId, nullptr, nullptr, nullptr));
+    runtime.reset(new OpenCLRuntime("./kernel.cl"));
+
+    auto inputDVariable = runtime->allocateDeviceVar(inputVariable);
+    runtime->writeBuffer(inputDVariable, inputRaw);
+
+    runtime->createKernel("Reshape");
+    runtime->createKernel("Conv");
+    runtime->createKernel("MatMul");
+
+    bool debug = false;
+
+    // Create a MatMul layer for testing
+    Layer::Variables mmInput, mmOutput;
+    Shape shapeA, shapeB;
+    if (debug) {
+      shapeA.set(32, 16, 0, 0);
+      shapeB.set(16, 32, 0, 0);
+    } else {
+      shapeA.set(512, 512, 0, 0);
+      shapeB.set(512, 512, 0, 0);
+    }
+    std::string matA, matB;
+    {
+      std::vector<float> inputDataA;
+      std::vector<float> inputDataB;
+      for (int i = 0; i < shapeA.x * shapeA.y; i++) {
+        inputDataA.push_back(i);
+      }
+      for (int i = 0; i < shapeB.x * shapeB.y; i++) {
+        inputDataB.push_back(i);
+      }
+
+      matA = vecToStr(inputDataA);
+      matB = vecToStr(inputDataB);
+    }
+    auto tensorA = std::make_shared<Tensor>("A", TensorProto::FLOAT, matA);
+    auto tensorB = std::make_shared<Tensor>("B", TensorProto::FLOAT, matB);
+    auto varA = std::make_shared<Variable>("A");
+    auto varB = std::make_shared<Variable>("B");
+    varA->elemType = TensorProto::FLOAT;
+    varA->tensor = tensorA;
+    varA->shape.s = shapeA;
+    varB->elemType = TensorProto::FLOAT;
+    varB->tensor = tensorB;
+    varB->shape.s = shapeB;
+    mmInput.push_back(varA);
+    mmInput.push_back(varB);
+    mmOutput.push_back(std::make_shared<Variable>("Y"));
+    auto mmLayer = std::make_shared<Layer>("MatMul", mmInput, mmOutput,
+                                           Layer::Attributes{});
+    rootLayer = mmLayer;
+
+    // printTensor(matA, varA->elemType, varA->shape.s);
+    // printTensor(matB, varB->elemType, varB->shape.s);
+
+    runtime->runLayers(rootLayer);
+
   } catch (const CLError& ex) {
     if (ex.code == CL_BUILD_PROGRAM_FAILURE) {
-      size_t logSize = 0;
-
-      clErrorCheck(clGetProgramBuildInfo(
-          program, deviceId, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize));
-
-      std::vector<char> log(logSize + 1);
-      clErrorCheck(clGetProgramBuildInfo(program, deviceId,
-                                         CL_PROGRAM_BUILD_LOG, logSize,
-                                         log.data(), nullptr));
-      log[logSize] = '\0';
-
-      std::cout << "Build error!" << std::endl;
-      std::cout << log.data() << std::endl;
+      std::cerr << "Build error!" << std::endl;
+      std::cerr << runtime->getBuildLog() << std::endl;
 
       return -1;
     } else {
-      std::rethrow_exception(std::current_exception());
+      std::cerr << "OpenCL Error: " << ex.code << std::endl;
     }
   }
-
-  // Run kernels
-
-  // It's enabled at higher than OpenCL 2.0
-  // cl_queue_properties prop[] = {
-  //   CL_QUEUE_PROPERTIES | CL_QUEUE_PROFILING_ENABLE,
-  //   0
-  // };
-  // cl_command_queue queue =
-  //     clCreateCommandQueueWithProperties(context, deviceId, prop, &ret);
-  // clErrorCheck(ret);
-  cl_command_queue queue =
-      clCreateCommandQueue(context, deviceId, CL_QUEUE_PROFILING_ENABLE, &ret);
-  clErrorCheck(ret);
-
-  std::map<std::string, std::shared_ptr<DeviceVariable>> deviceVariableMap;
-
-  auto allocateDeviceVar = [&](std::shared_ptr<Variable> var) {
-    auto it = deviceVariableMap.find(var->name);
-    if (it != deviceVariableMap.end()) {
-      return it->second;
-    } else {
-      auto dv = std::make_shared<DeviceVariable>(var, context);
-      deviceVariableMap.emplace(var->name, dv);
-      return dv;
-    }
-  };
-
-  auto writeBuffer = [&](cl_command_queue queue,
-                         std::shared_ptr<DeviceVariable> dest,
-                         const std::string& src) {
-    assert(dest->size == src.size());
-    clErrorCheck(clEnqueueWriteBuffer(queue, dest->buffer(), CL_TRUE, 0,
-                                      dest->size, src.data(), 0, nullptr,
-                                      nullptr));
-  };
-
-  auto readBuffer = [&](cl_command_queue queue,
-                        std::vector<unsigned char>& dest,
-                        std::shared_ptr<DeviceVariable> src) {
-    assert(dest.size() == src->size);
-    clErrorCheck(clEnqueueReadBuffer(queue, src->buffer(), CL_TRUE, 0,
-                                     dest.size(), dest.data(), 0, nullptr,
-                                     nullptr));
-  };
-
-  auto inputDVariable = allocateDeviceVar(inputVariable);
-  writeBuffer(queue, inputDVariable, inputRaw);
-
-  std::map<std::string, cl_kernel> kernels;
-  auto createKernel = [&](const std::string& name) {
-    kernels.emplace(name, clCreateKernel(program, name.c_str(), &ret));
-    clErrorCheck(ret);
-  };
-
-  createKernel("Reshape");
-  createKernel("Conv");
-  createKernel("MatMul");
-
-  bool debug = false;
-
-  // Create a MatMul layer for testing
-  Layer::Variables mmInput, mmOutput;
-  Shape shapeA, shapeB;
-  if (debug) {
-    shapeA.set(32, 16, 0, 0);
-    shapeB.set(16, 32, 0, 0);
-  } else {
-    shapeA.set(512, 512, 0, 0);
-    shapeB.set(512, 512, 0, 0);
-  }
-  std::string matA, matB;
-  {
-    std::vector<float> inputDataA;
-    std::vector<float> inputDataB;
-    for (int i = 0; i < shapeA.x * shapeA.y; i++) {
-      inputDataA.push_back(i);
-    }
-    for (int i = 0; i < shapeB.x * shapeB.y; i++) {
-      inputDataB.push_back(i);
-    }
-
-    matA = vecToStr(inputDataA);
-    matB = vecToStr(inputDataB);
-  }
-  auto tensorA = std::make_shared<Tensor>("A", TensorProto::FLOAT, matA);
-  auto tensorB = std::make_shared<Tensor>("B", TensorProto::FLOAT, matB);
-  auto varA = std::make_shared<Variable>("A");
-  auto varB = std::make_shared<Variable>("B");
-  varA->elemType = TensorProto::FLOAT;
-  varA->tensor = tensorA;
-  varA->shape.s = shapeA;
-  varB->elemType = TensorProto::FLOAT;
-  varB->tensor = tensorB;
-  varB->shape.s = shapeB;
-  mmInput.push_back(varA);
-  mmInput.push_back(varB);
-  mmOutput.push_back(std::make_shared<Variable>("Y"));
-  auto mmLayer =
-      std::make_shared<Layer>("MatMul", mmInput, mmOutput, Layer::Attributes{});
-  rootLayer = mmLayer;
-
-  // printTensor(matA, varA->elemType, varA->shape.s);
-  // printTensor(matB, varB->elemType, varB->shape.s);
-
-  using DeviceVariables = std::vector<std::shared_ptr<DeviceVariable>>;
-  int ii = 0;
-  for (auto currentLayer = rootLayer; currentLayer != nullptr;
-       currentLayer = currentLayer->child) {
-    if (ii >= 1) break;
-
-    const std::string layerName = currentLayer->name;
-
-    cout << "Run " << layerName << endl;
-
-    if (layerName == "Reshape") {
-      auto& data = currentLayer->inputs[0];
-      auto& shape = currentLayer->inputs[1];
-      auto& reshaped = currentLayer->outputs[0];
-
-      // TODO: Read tensor from device memory
-      auto shapeValue = shape->tensor->getDataAs<TensorProto::INT64>();
-      shapeValue.resize(4, 0);
-
-      int varIndex = -1;
-      int knownSize = 1;
-      for (int i = 0; i < shapeValue.size(); i++) {
-        if (shapeValue[i] == 0) {
-          shapeValue[i] = data->shape.raw[i];
-        }
-
-        if (shapeValue[i] == -1) {
-          varIndex = i;
-        } else {
-          knownSize *= shapeValue[i];
-        }
-      }
-      if (varIndex >= 0) {
-        shapeValue[varIndex] = data->elementCount() / knownSize;
-      }
-
-      Shape newShape;
-      newShape.x = shapeValue[0];
-      newShape.y = shapeValue[1];
-      newShape.z = shapeValue[2];
-      newShape.w = shapeValue[3];
-
-      reshaped->shape.s = newShape;
-      reshaped->elemType = data->elemType;
-    } else if (layerName == "Conv") {
-      auto& X = currentLayer->inputs[0];
-      auto& W = currentLayer->inputs[1];
-      auto& B = currentLayer->inputs[2];
-      auto& Y = currentLayer->outputs[0];
-
-    } else if (layerName == "MatMul") {
-      auto& A = currentLayer->inputs[0];
-      auto& B = currentLayer->inputs[1];
-      auto& Y = currentLayer->outputs[0];
-
-      Shape newShape;
-      newShape.x = B->shape.s.x;
-      newShape.y = A->shape.s.y;
-      newShape.z = A->shape.s.z;
-      newShape.w = A->shape.s.w;
-
-      Y->shape.s = newShape;
-      Y->elemType = A->elemType;
-    }
-
-    auto kernel = kernels[layerName];
-
-    int argCount = 0;
-
-    DeviceVariables dinputs;
-    for (auto& input : currentLayer->inputs) {
-      cout << input->toString() << endl;
-      auto dv = allocateDeviceVar(input);
-      dinputs.push_back(dv);
-      if (dv->var->tensor) {
-        writeBuffer(queue, dv, dv->var->tensor->raw);
-      } else {
-        // It should be done to writeBuffer to dv.
-      }
-
-      clErrorCheck(
-          clSetKernelArg(kernel, argCount++, sizeof(cl_mem), dv->bufferPtr()));
-      clErrorCheck(
-          clSetKernelArg(kernel, argCount++, sizeof(Shape), &dv->var->shape));
-    }
-    DeviceVariables doutputs;
-    for (auto& output : currentLayer->outputs) {
-      cout << output->toString() << endl;
-      auto dv = allocateDeviceVar(output);
-      doutputs.push_back(dv);
-
-      clErrorCheck(
-          clSetKernelArg(kernel, argCount++, sizeof(cl_mem), dv->bufferPtr()));
-      clErrorCheck(
-          clSetKernelArg(kernel, argCount++, sizeof(Shape), &dv->var->shape));
-    }
-
-    // const size_t globalSize[] = {dinputs[0]->var->elementCount()};
-    const size_t globalSize[] = {1};
-    const size_t localSize[] = {1};
-    cl_event handler;
-    clErrorCheck(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, globalSize,
-                                        localSize, 0, nullptr, &handler));
-
-    clErrorCheck(clWaitForEvents(1, &handler));
-    {
-      cl_ulong start, end;
-      clErrorCheck(clGetEventProfilingInfo(handler, CL_PROFILING_COMMAND_START,
-                                           sizeof(cl_ulong), &start, NULL));
-      clErrorCheck(clGetEventProfilingInfo(handler, CL_PROFILING_COMMAND_END,
-                                           sizeof(cl_ulong), &end, NULL));
-      std::cout << "execution time: " << (end - start) / (1000 * 1000) << "(ms)"
-                << endl;
-    }
-    clErrorCheck(clReleaseEvent(handler));
-
-    auto out = doutputs[0];
-    std::vector<unsigned char> res(out->size, 0);
-    readBuffer(queue, res, out);
-
-    std::ofstream ofs("output.bin", std::ios::binary);
-    for (auto v : res) {
-      ofs << v;
-    }
-
-    if (debug) {
-      printTensor(res, out->var->elemType, out->var->shape.s);
-    }
-
-    ii++;
-  }
-
-  for (auto p : kernels) {
-    clErrorCheck(clReleaseKernel(p.second));
-  }
-
-  // TODO: Release there objects even when an error is occured.
-  clErrorCheck(clFlush(queue));
-  clErrorCheck(clFinish(queue));
-  clErrorCheck(clReleaseProgram(program));
-  clErrorCheck(clReleaseCommandQueue(queue));
-  clErrorCheck(clReleaseContext(context));
 
   return 0;
 }
