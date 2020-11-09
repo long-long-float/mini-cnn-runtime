@@ -7,3 +7,6 @@ cnnr: main.cpp onnx.proto3.pb.o
 onnx.proto3.pb.o: onnx.proto3.pb.cc
 	$(COMPILER) $(OPTIONS) -c -o $@ $^
 
+test: test.cpp
+	$(COMPILER) -std=c++14 $^ -o $@ -L/usr/local/lib -lgtest -lgtest_main -pthread
+
