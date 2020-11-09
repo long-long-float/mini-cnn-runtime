@@ -417,9 +417,14 @@ class OpenCLRuntime {
     }
   }
 
-  void runLayers(std::shared_ptr<Layer> rootLayer) {
+  std::pair<std::shared_ptr<DeviceVariable>, std::vector<unsigned char>>
+  runLayers(std::shared_ptr<Layer> rootLayer) {
     using DeviceVariables = std::vector<std::shared_ptr<DeviceVariable>>;
     int ii = 0;
+
+    std::shared_ptr<DeviceVariable> result;
+    std::vector<unsigned char> rawResult;
+
     for (auto currentLayer = rootLayer; currentLayer != nullptr;
          currentLayer = currentLayer->child) {
       if (ii >= 1) break;
@@ -535,19 +540,21 @@ class OpenCLRuntime {
       }
       clErrorCheck(clReleaseEvent(handler));
 
-      auto out = doutputs[0];
-      std::vector<unsigned char> res(out->size, 0);
-      readBuffer(res, out);
+      result = doutputs[0];
+      rawResult.resize(result->size, 0);
+      readBuffer(rawResult, result);
 
       std::ofstream ofs("output.bin", std::ios::binary);
-      for (auto v : res) {
+      for (auto v : rawResult) {
         ofs << v;
       }
 
-      printTensor(res, out->var->elemType, out->var->shape.s);
+      printTensor(rawResult, result->var->elemType, result->var->shape.s);
 
       ii++;
     }
+
+    return std::make_pair(result, rawResult);
   }
 
   std::string getBuildLog() {
