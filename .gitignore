@@ -1,3 +1,4 @@
-*.o
-a.out
-cnnr
+build
+output.bin
+model.dot
+
