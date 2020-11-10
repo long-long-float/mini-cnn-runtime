@@ -1,19 +1,27 @@
 #include <gtest/gtest.h>
 
+#include <vector>
+
+#include "OpenCLRuntime.h"
+#include "Utility.h"
+
+using namespace minicnn;
+using namespace onnx;
+
 TEST(Simple, Add) { EXPECT_TRUE(1 + 1 == 2); }
 
 int idx(int x, int y, int w) { return y * w + x; }
 
 void matmul(const std::vector<float>& a, Shape shapeA,
-            const std::vector<float>& b, Shape shapeB, std::vector<float>& y,
+            const std::vector<float>& b, Shape shapeB, std::vector<float>& yy,
             Shape shapeY) {
   for (int y = 0; y < shapeY.y; y++) {
     for (int x = 0; x < shapeY.x; x++) {
       float sum = 0.0f;
       for (int i = 0; i < shapeA.x; i++) {
-        sum += A[idx(i, y, shapeA.x)] * B[idx(x, i, shapeB.x)];
+        sum += a[idx(i, y, shapeA.x)] * a[idx(x, i, shapeB.x)];
       }
-      Y[idx(x, y, shapeY.x)] = sum;
+      yy[idx(x, y, shapeY.x)] = sum;
     }
   }
 }
@@ -53,21 +61,24 @@ TEST(Kernel, MatMul) {
 
   auto mmLayer =
       std::make_shared<Layer>("MatMul", mmInput, mmOutput, Layer::Attributes{});
-  rootLayer = mmLayer;
 
   Shape shapeRef;
-  shapeRef.x = shapeB.s.x;
-  shapeRef.y = shapeA.s.y;
-  shapeRef.z = shapeA.s.z;
-  shapeRef.w = shapeA.s.w;
+  shapeRef.x = shapeB.x;
+  shapeRef.y = shapeA.y;
+  shapeRef.z = shapeA.z;
+  shapeRef.w = shapeA.w;
   std::vector<float> ref(shapeRef.x * shapeRef.y);
 
   matmul(inputDataA, shapeA, inputDataB, shapeB, ref, shapeRef);
 
-  std::string rawRef = vecToStr(ref);
+  std::string rawRef(vecToStr(ref));
 
-  auto result = runtime->runLayers(rootLayer);
+  OpenCLRuntime runtime("./kernel-dummy.cl");
+  runtime.createKernel("MatMul");
+  auto result = runtime.runLayers(mmLayer);
 
-  EXPECT_EQ(rawRef, result.second);
+  std::string rawResult(result.second.begin(), result.second.end());
+
+  EXPECT_EQ(rawRef, rawResult);
 }
 
