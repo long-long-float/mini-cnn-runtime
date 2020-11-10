@@ -1,9 +1,9 @@
 #pragma once
 
-#include "onnx.proto3.pb.h"
-
 #include <iomanip>
 #include <iostream>
+
+#include "onnx.proto3.pb.h"
 namespace minicnn {
 
 using ElementType = onnx::TensorProto::DataType;
@@ -85,12 +85,15 @@ class Tensor {
   }
 };
 
+// raw is expected as container of bytes (e.g. vector<unsigned char>, string)
 template <class R>
-void printTensor(const R& raw, ElementType elemType, Shape shape) {
-  std::cout << "[" << std::endl;
+std::string tensorToStr(const R& raw, ElementType elemType, Shape shape,
+                        bool omit) {
+  std::stringstream ss;
+  ss << "[\n";
   int elemSize = getSize(elemType);
   for (int y = 0; y < shape.y; y++) {
-    std::cout << " [";
+    ss << " [";
     for (int x = 0; x < shape.x; x++) {
       int idx = (y * shape.x + x) * elemSize;
       int v = 0;
@@ -98,21 +101,33 @@ void printTensor(const R& raw, ElementType elemType, Shape shape) {
         unsigned char c = raw[idx + i];
         v |= c << (i * 8);
       }
-      std::cout << std::setw(3) << *reinterpret_cast<float*>(&v) << " ";
+      ss << std::setw(3) << *reinterpret_cast<float*>(&v) << " ";
 
-      if (x > 10) {
-        std::cout << "...";
+      if (omit && x > 10) {
+        ss << "...";
         break;
       }
     }
-    std::cout << "]" << std::endl;
+    ss << "]\n";
 
-    if (y > 10) {
-      std::cout << "..." << std::endl;
+    if (omit && y > 10) {
+      ss << "...\n";
       break;
     }
   }
-  std::cout << "]" << std::endl;
+  ss << "]\n";
+
+  return ss.str();
+}
+
+template <>
+std::string tensorToStr<std::vector<float>>(const std::vector<float>& raw,
+                                            ElementType elemType, Shape shape,
+                                            bool omit);
+
+template <class R>
+void printTensor(const R& raw, ElementType elemType, Shape shape, bool omit) {
+  std::cout << tensorToStr(raw, elemType, shape, omit) << std::endl;
 }
 
 // Host-side

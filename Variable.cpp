@@ -25,6 +25,36 @@ ElementType minicnn::toElementType(int type) {
   return static_cast<ElementType>(type);
 }
 
+template <>
+std::string minicnn::tensorToStr<std::vector<float>>(const std::vector<float>& raw,
+                                            ElementType elemType, Shape shape,
+                                            bool omit) {
+  std::stringstream ss;
+  ss << "[\n";
+  assert(elemType == onnx::TensorProto::FLOAT);
+  for (int y = 0; y < shape.y; y++) {
+    ss << " [";
+    for (int x = 0; x < shape.x; x++) {
+      int idx = y * shape.x + x;
+      ss << std::setw(3) << raw[idx] << " ";
+
+      if (omit && x > 10) {
+        ss << "...";
+        break;
+      }
+    }
+    ss << "]\n";
+
+    if (omit && y > 10) {
+      ss << "...\n";
+      break;
+    }
+  }
+  ss << "]\n";
+
+  return ss.str();
+}
+
 Variable::Variable(const onnx::ValueInfoProto& info,
                    std::shared_ptr<Tensor> tensor)
     : Variable(info.name()) {

@@ -31,6 +31,8 @@ TEST(Kernel, MatMul) {
   Shape shapeA, shapeB;
   shapeA.set(32, 16, 0, 0);
   shapeB.set(16, 32, 0, 0);
+  // shapeA.set(10, 10, 0, 0);
+  // shapeB.set(10, 10, 0, 0);
   std::string matA, matB;
 
   std::vector<float> inputDataA;
@@ -71,14 +73,16 @@ TEST(Kernel, MatMul) {
 
   matmul(inputDataA, shapeA, inputDataB, shapeB, ref, shapeRef);
 
-  std::string rawRef(vecToStr(ref));
+  std::string refStr(tensorToStr(ref, TensorProto::FLOAT, shapeRef, false));
 
-  OpenCLRuntime runtime("./kernel-dummy.cl");
+  OpenCLRuntime runtime("./kernel.cl");
   runtime.createKernel("MatMul");
   auto result = runtime.runLayers(mmLayer);
 
   std::string rawResult(result.second.begin(), result.second.end());
+  auto &rv = result.first->var;
+  std::string resultStr(tensorToStr(rawResult, rv->elemType, rv->shape.s, false));
 
-  EXPECT_EQ(rawRef, rawResult);
+  EXPECT_EQ(refStr, resultStr);
 }
 

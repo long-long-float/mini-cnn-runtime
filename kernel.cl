@@ -13,7 +13,7 @@ __kernel void Conv(__global float* X, __global float* W, __global float* B,
 
 __kernel void MatMul(__global float* A, int4 shapeA, __global float* B,
                      int4 shapeB, __global float* Y, int4 shapeY) {
-#if 0
+#if 1
   for (int y = 0; y < shapeY.y; y++) {
     for (int x = 0; x < shapeY.x; x++) {
       float sum = 0.0f;
@@ -48,8 +48,8 @@ __kernel void MatMul(__global float* A, int4 shapeA, __global float* B,
           sum += ((float*)&a16)[j] * b16[j];
         }
       }
+      Y[idx(x, y, shapeY.x)] = sum;
+    }
+  }
 #endif
-  Y[idx(x, y, shapeY.x)] = sum;
-}
-}
 }
